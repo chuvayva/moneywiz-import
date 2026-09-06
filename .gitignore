@@ -1,0 +1,6 @@
+private/
+*.xlsx
+*.csv
+.bundle/
+vendor/
+*.sqlite*

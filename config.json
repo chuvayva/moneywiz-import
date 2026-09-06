@@ -1,0 +1,8 @@
+{
+  "database": "~/Library/Containers/com.moneywiz.personalfinance/Data/Library/Application Support/MoneyWiz_iCloud.sqlite",
+  "timezone": "Asia/Tbilisi",
+  "accounts": {"GEL": "Solo ლ", "USD": "Solo $", "EUR": "Solo €"},
+  "match_days": 5,
+  "review_days": 10,
+  "verification_seconds": 20
+}
