@@ -137,7 +137,8 @@ This is the command that **creates real MoneyWiz transactions**. It:
    a fresh backup.
 2. Rechecks existing entries and remembers matched/skipped source identities in
    `private/ledger.json`.
-3. Reconciles again immediately before each new entry.
+3. Reconciles again immediately before each new entry, against the backup that
+   verified the previous save in this run.
 4. Durably reserves that entry, sends its MoneyWiz URL, and verifies the resulting
    app record through a fresh backup before moving to the next one.
 5. Stops if a save cannot be confirmed. It does not blindly retry.
@@ -262,6 +263,8 @@ Use the exact active account names and matching currencies in `config.json`.
 The current mappings are `GEL → Solo ლ`, `USD → Solo $`, and `EUR → Solo €`.
 After changing mappings, generate a new import. `apply` rejects a changed config.
 Use `--config '/path/to/config.json'` consistently for an alternative configuration.
+`keep_backups` (default 1) sets how many database backups stay in
+`private/backups/`; every database-backed command removes older ones.
 
 ### Work from a retained backup
 
@@ -292,14 +295,16 @@ project; if you move it, update those links. UI tests require Google Chrome;
 - Category precedence: your explicit per-row choice, then an "always" merchant
   rule from the ledger or the decisions file, then a category learned from at
   least three unambiguous exact matches of the merchant that all agree. Otherwise
-  the URL omits category and retains the full bank description. MoneyWiz's own
-  categorization preferences can still affect the saved category.
+  the URL omits category. MoneyWiz's own categorization preferences can still
+  affect the saved category.
+- Created records get the merchant name as description and only the source marker
+  (`[bog-v1-…]`) as memo. The full bank text stays in the plan JSON/CSV.
 - Payment-service `payment code` values identify some bank rows. Card purchases
   use a SHA-256 fingerprint of bank account, currency, signed amount, purchase
   timestamp, full merchant, and card suffix. Filename and posting date are excluded
   from card fingerprints. Fallback rows use timestamp/date plus full description.
 - Matched source identities map to MoneyWiz's stable `ZGID`. Imported records carry
-  a source marker in description and memo, supporting recovery without the ledger.
+  a source marker in the memo, supporting recovery without the ledger.
 - If bank amounts/descriptions change enough to alter a fingerprint, reconciliation
   still runs. Without true bank IDs, perfect automatic matching is not guaranteed.
 
@@ -321,7 +326,8 @@ snapshot cannot lock MoneyWiz against another writer between checks.
   rules and declined suggestions. Keep this across all runs.
 - `private/backups/`: consistent SQLite backups including committed WAL data.
   The live connection is read-only and only used for backup; reconciliation SELECTs
-  run on copies. Pre-import backups are retained; verification copies are temporary.
+  run on copies. Only the newest `keep_backups` pre-import backups are retained
+  (default 1); verification copies are temporary.
 - These snapshots are not a complete attachment/cloud export. The script never
   restores or directly modifies MoneyWiz's database.
 - Private artifacts contain financial information. They and XLSX files are ignored

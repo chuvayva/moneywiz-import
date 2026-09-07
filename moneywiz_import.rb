@@ -78,6 +78,8 @@ module MoneyWizImport
   # SQLite's online backup includes committed WAL pages. The source is read-only;
   # every SELECT used for reconciliation runs against the resulting copy.
   class Snapshot
+    NAME = /\A\d{8}T\d{6}-[0-9a-f]{10}\.sqlite\z/
+
     def self.take(source, directory: File.join(PRIVATE, "backups"))
       FileUtils.mkdir_p(directory, mode: 0o700)
       path = File.join(directory, "#{Time.now.utc.strftime('%Y%m%dT%H%M%S')}-#{SecureRandom.hex(5)}.sqlite")
@@ -86,16 +88,20 @@ module MoneyWizImport
       backup = SQLite3::Backup.new(output, "main", input, "main")
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15
       loop do
-        result = backup.step(512)
+        result = backup.step(4096)
         break if result == SQLite3::Constants::ErrorCode::DONE
         raise Error, "Database backup timed out" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
         unless [SQLite3::Constants::ErrorCode::OK, SQLite3::Constants::ErrorCode::BUSY, SQLite3::Constants::ErrorCode::LOCKED].include?(result)
           raise Error, "Database backup failed: #{result}"
         end
-        sleep 0.05
+        # Wait only while MoneyWiz holds a lock; an unconditional pause made every copy take seconds.
+        sleep 0.05 unless result == SQLite3::Constants::ErrorCode::OK
       end
       backup.finish
       backup = nil
+      # The copy inherits WAL mode from MoneyWiz; a rollback journal keeps later
+      # read-only opens from leaving -wal/-shm files next to the backup.
+      output.execute("PRAGMA journal_mode=DELETE")
       raise Error, "Snapshot integrity check failed" unless output.get_first_value("PRAGMA quick_check") == "ok"
       File.chmod(0o600, path)
       path
@@ -103,6 +109,19 @@ module MoneyWizImport
       backup&.finish
       output&.close
       input&.close
+    end
+
+    # Retained backups are a safety net, not an archive: keep only the newest ones,
+    # and remove journal files left behind by older read-only opens.
+    def self.prune(directory, keep:)
+      raise Error, "keep_backups must be a positive integer" unless keep.is_a?(Integer) && keep.positive?
+      return unless Dir.exist?(directory)
+      kept = Dir.children(directory).grep(NAME).sort.last(keep)
+      Dir.children(directory).each do |name|
+        base = name.sub(/-(wal|shm|journal)\z/, "")
+        next unless base.match?(NAME) && !kept.include?(base)
+        File.delete(File.join(directory, name))
+      end
     end
   end
 
@@ -491,8 +510,8 @@ module MoneyWizImport
     raise Error, "Only new, classified transactions can be created" unless entry["status"] == "new" && (entry["kind"] == "Payment" || %w[income expense].include?(entry["operation"]))
     params = { "account" => entry.fetch("account").gsub(/[[:space:]]/, ""), "amount" => money(entry.fetch("cents").abs),
                "currency" => entry.fetch("currency"), "date" => entry.fetch("occurred"), "save" => "true",
-               "description" => "#{entry.fetch('description')} [#{entry.fetch('id')}]",
-               "memo" => "Bank of Georgia; posted #{entry.fetch('posted')}; [#{entry.fetch('id')}]" }
+               # Only the merchant name and the source marker; the bank's full text stays in the plan.
+               "description" => entry.fetch("payee").to_s, "memo" => "[#{entry.fetch('id')}]" }
     params["category"] = entry["category"] if entry["category"]
     # Do not create hundreds of payees from bank merchant spelling variations.
     query = URI.encode_www_form(params).gsub("+", "%20")
@@ -543,7 +562,9 @@ module MoneyWizImport
         overrides = MoneyWizImport.validate_overrides(plan["category_overrides"] || {})
         rules = MoneyWizImport.validate_rules(plan["merchant_rules"] || {})
         planner_options = { decisions: plan.fetch("decisions"), categories: overrides, rules: rules }
-        reference = Reference.new(@snapshotter.call)
+        retained = @snapshotter.call
+        Snapshot.prune(File.dirname(retained), keep: @config.fetch("keep_backups", 1))
+        reference = Reference.new(retained)
         bank = CLI.load_bank(plan.fetch("sources").map { |s| s.fetch("path") })
         current = Planner.new(bank, reference, @config, ledger: state, **planner_options).build
         intended = plan.fetch("entries").select { |e| e["status"] == "new" }.to_h { |e| [e["id"], e] }
@@ -562,12 +583,15 @@ module MoneyWizImport
         # Remember both "always" and declined merchant category answers.
         save(state, merchant_rules.merge(rules))
         count = 0
+        # The newest snapshot: the retained one until a save is verified, then the
+        # copy that verified it. Reusing it avoids a second 130 MB copy per entry.
+        latest = retained
         current.each do |entry|
           next unless intended.key?(entry["id"])
           next if %w[existing skip].include?(entry["status"])
-          # Reconcile again immediately before each URL, including transactions
-          # saved earlier in this run or manually added since the first snapshot.
-          fresh = Reference.new(@snapshotter.call)
+          # Reconcile again immediately before each URL against a snapshot taken
+          # after every transaction saved earlier in this run.
+          fresh = Reference.new(latest)
           entry = Planner.new(bank, fresh, @config, ledger: state, **planner_options).build.find { |e| e["id"] == entry["id"] }
           if entry["status"] == "existing"
             state[entry["id"]] = { "status" => "matched", "gid" => entry.fetch("match_gid") }
@@ -591,11 +615,17 @@ module MoneyWizImport
                 t = matches.first
                 verified = t if t["account"] == entry["account"] && t["currency"] == entry["currency"] && t["cents"] == entry["cents"] && t["date"] == entry["occurred"][0, 10] && (!entry["category"] || t["category"] == entry["category"])
               end
-              break if verified
-            ensure
-              # Keep the pre-import backup; verification snapshots are temporary.
+            rescue StandardError
               File.delete(path) if File.exist?(path)
+              raise
             end
+            if verified
+              # Keep the pre-import backup; this copy is the reference for the next entry.
+              File.delete(latest) if latest != retained && File.exist?(latest)
+              latest = path
+              break
+            end
+            File.delete(path) if File.exist?(path)
             break if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
             sleep 1
           end
@@ -606,6 +636,9 @@ module MoneyWizImport
           puts "Verified #{count}/#{intended.size}: #{entry['occurred'][0, 10]} #{MoneyWizImport.money(entry['cents'])} #{entry['currency']}"
         end
         puts "Imported and verified #{count} transactions."
+      ensure
+        # Verification copies are temporary; only the pre-import backup stays.
+        File.delete(latest) if latest && latest != retained && File.exist?(latest)
       end
     end
   end
@@ -720,7 +753,7 @@ module MoneyWizImport
         options[:out] ||= File.join(File.dirname(original_path), "resolved.json")
         argv = previous.fetch("sources").map { |source| source.fetch("path") }
       end
-      snapshot = options[:snapshot] || Snapshot.take(config.fetch("database"))
+      snapshot = options[:snapshot] || Snapshot.take(config.fetch("database")).tap { |path| Snapshot.prune(File.dirname(path), keep: config.fetch("keep_backups", 1)) }
       reference = Reference.new(snapshot)
       if command == "accounts"
         puts JSON.pretty_generate(reference.accounts)

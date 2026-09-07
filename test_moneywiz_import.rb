@@ -76,13 +76,16 @@ class MoneyWizImportTest < Minitest::Test
   def test_exact_money_and_escaped_url
     assert_equal 100000, M.cents("1,000.00")
     assert_equal "-0.26", M.money(-26)
-    entry = bank(description: "Café + bread & 50% [x]", status: "new")
+    entry = bank(description: "Café + bread & 50% [x]", payee: "Café & Co", status: "new")
     url = M.url(entry)
     params = URI.decode_www_form(URI(url).query).to_h
     assert_equal "Soloლ", params["account"]
     assert_equal "10.00", params["amount"]
     assert_equal "true", params["save"]
-    assert_equal "Café + bread & 50% [x] [bank1]", params["description"]
+    # Only the merchant name and the marker reach MoneyWiz, not the bank's full text.
+    assert_equal "Café & Co", params["description"]
+    assert_equal "[bank1]", params["memo"]
+    refute_includes url, "bread"
     refute params.key?("category")
     refute_includes url, "+"
   end
@@ -165,7 +168,7 @@ class MoneyWizImportTest < Minitest::Test
   def test_transactions_claimed_by_other_rows_are_never_candidates
     # Same merchant, same day, same amount: t1 was created for bank1 moments ago.
     marker_id = "bog-v1-#{'a' * 64}-1"
-    created = transaction(id: "t1", description: "Bank description & details [#{marker_id}]", memo: "Bank of Georgia; posted 2026-09-01; [#{marker_id}]")
+    created = transaction(id: "t1", description: "Shop", memo: "[#{marker_id}]")
     entries = plan([bank(id: marker_id), bank(id: "bank2")], [created])
     assert_equal %w[existing new], entries.map { |e| e["status"] }
     assert_equal "import marker", entries.first["reason"]
@@ -202,6 +205,23 @@ class MoneyWizImportTest < Minitest::Test
       assert_equal before, [path, "#{path}-wal"].map { |p| Digest::SHA256.file(p).hexdigest }
       reader.close
       db.close
+      # Read-only opens of the copy leave no -wal/-shm files behind.
+      assert_equal [File.basename(copy)], Dir.children(File.join(dir, "backups"))
+    end
+  end
+
+  def test_prune_keeps_newest_backups_and_removes_orphaned_journals
+    Dir.mktmpdir do |dir|
+      names = %w[20260901T000000-aaaaaaaaaa 20260902T000000-bbbbbbbbbb 20260903T000000-cccccccccc]
+      names.each { |n| File.write(File.join(dir, "#{n}.sqlite"), "") }
+      File.write(File.join(dir, "20260801T000000-dddddddddd.sqlite-wal"), "")
+      File.write(File.join(dir, "20260801T000000-dddddddddd.sqlite-shm"), "")
+      File.write(File.join(dir, "notes.txt"), "unrelated")
+      M::Snapshot.prune(dir, keep: 2)
+      assert_equal %w[20260902T000000-bbbbbbbbbb.sqlite 20260903T000000-cccccccccc.sqlite notes.txt], Dir.children(dir).sort
+      M::Snapshot.prune(dir, keep: 5)
+      assert_equal 3, Dir.children(dir).size
+      assert_raises(M::Error) { M::Snapshot.prune(dir, keep: 0) }
     end
   end
 
@@ -227,7 +247,7 @@ class MoneyWizImportTest < Minitest::Test
     assert both.any? { |e| e["bank_payment_code"] }
   end
 
-  def with_fake_application
+  def with_fake_application(banks: [bank])
     Dir.mktmpdir do |dir|
       source = File.join(dir, "fake-app.sqlite")
       db = SQLite3::Database.new(source)
@@ -245,10 +265,10 @@ class MoneyWizImportTest < Minitest::Test
       save_in_fake_app = lambda do |url|
         calls << url
         params = URI.decode_www_form(URI(url).query).to_h
-        db.execute("INSERT INTO ZSYNCOBJECT (Z_PK,Z_ENT,ZGID,ZACCOUNT2,ZDATE1,ZAMOUNT1,ZDESC2,ZNOTES1) VALUES (2,48,'created-1',1,?,-10,?,?)",
-                   [Time.local(2026, 9, 1, 12).to_i - 978_307_200, params.fetch("description"), params.fetch("memo")])
+        db.execute("INSERT INTO ZSYNCOBJECT (Z_PK,Z_ENT,ZGID,ZACCOUNT2,ZDATE1,ZAMOUNT1,ZDESC2,ZNOTES1) VALUES (?,48,?,1,?,?,?,?)",
+                   [calls.size + 1, "created-#{calls.size}", Time.local(2026, 9, 1, 12).to_i - 978_307_200, params.fetch("amount").to_f * -1, params.fetch("description"), params.fetch("memo")])
       end
-      M::CLI.stub(:load_bank, [bank]) do
+      M::CLI.stub(:load_bank, banks) do
         yield dir, plan, calls, snapshots, save_in_fake_app
       end
     ensure
@@ -262,6 +282,22 @@ class MoneyWizImportTest < Minitest::Test
       capture_io { runner.apply(plan); runner.apply(plan) }
       assert_equal 1, calls.size
       assert_equal "created-1", runner.ledger.dig("bank1", "gid")
+    end
+  end
+
+  def test_apply_reuses_verification_snapshots_and_keeps_only_one_backup
+    second = bank(id: "bank2", amount: -2000)
+    with_fake_application(banks: [bank, second]) do |dir, plan, calls, snapshots, opener|
+      taken = []
+      counting = -> { snapshots.call.tap { |path| taken << path } }
+      runner = M::Runner.new(@config, state_path: File.join(dir, "ledger.json"), snapshotter: counting, opener: opener)
+      plan = plan.merge("entries" => [bank(status: "new"), second.merge("status" => "new")])
+      capture_io { runner.apply(plan) }
+      assert_equal 2, calls.size
+      assert_equal %w[created-1 created-2], %w[bank1 bank2].map { |id| runner.ledger.dig(id, "gid") }
+      # One retained backup plus one verification copy per entry; nothing copied twice.
+      assert_equal 3, taken.size
+      assert_equal [File.basename(taken.first)], Dir.children(File.join(dir, "backups"))
     end
   end
 
