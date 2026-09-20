@@ -89,14 +89,14 @@ class ReviewTest < Minitest::Test
     assert_equal({ "action" => "new" }, evaluate("decisions['review-1']"))
   end
 
-  def test_locked_records_have_no_editor_and_non_purchase_needs_classification
+  def test_locked_records_have_no_editor_and_non_purchase_saves_as_plain_new
     click('tr[data-id="locked-1"] button')
     assert_nil @browser.at_css("#decision-action")
     click('tr[data-id="fx-1"] button')
     action("new")
+    assert_includes @browser.at_css("#inspector").text, "titled “FX”"
     click("#save-decision")
-    assert_includes @browser.at_css("#decision-error").text, "Confirm"
-    assert_nil evaluate("decisions['fx-1']")
+    assert_equal({ "action" => "new" }, evaluate("decisions['fx-1']"))
   end
 
   def test_download_exports_file_and_does_not_execute_commands
@@ -105,7 +105,7 @@ class ReviewTest < Minitest::Test
     action("skip")
     click("#save-decision")
     click("#download-top")
-    path = File.join(@dir, "moneywiz-decisions-test-pla.json")
+    path = File.join(@dir, "decisions.json")
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
     until File.exist?(path)
       raise "Download missing" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
@@ -114,6 +114,19 @@ class ReviewTest < Minitest::Test
     assert_equal "skip", JSON.parse(File.read(path)).dig("decisions", "new-1", "action")
     assert_equal false, evaluate("dirty()")
     assert_equal true, evaluate("document.getElementById('export-dialog').open")
+  end
+
+  def test_apply_command_defaults_to_decisions_beside_plan_and_adds_flag_elsewhere
+    assert_equal "#{@dir}/decisions.json", evaluate("document.getElementById('decision-path').value")
+    @browser.execute("plan.config_path=plan.project_path+'/config.json'; commands()")
+    refute_includes evaluate("document.getElementById('import-command').textContent"), "--config", "the default config needs no flag"
+    @browser.execute("plan.config_path='/elsewhere/other.json'; commands()")
+    assert_includes evaluate("document.getElementById('import-command').textContent"), "--config '/elsewhere/other.json'"
+    @browser.execute("delete plan.config_path; commands()")
+    assert_equal "moneywiz_import.rb apply '#{@path}'", evaluate("document.getElementById('apply-command').textContent")
+    @browser.execute("const p=document.getElementById('decision-path'); p.value='/Users/me/Downloads/decisions.json'; p.dispatchEvent(new Event('input'))")
+    assert_equal "moneywiz_import.rb apply '#{@path}' --decisions '/Users/me/Downloads/decisions.json'", evaluate("document.getElementById('apply-command').textContent")
+    assert_includes evaluate("document.getElementById('resolve-command').textContent"), "--decisions '/Users/me/Downloads/decisions.json'"
   end
 
   def test_save_picker_cancellation_keeps_dirty_state
@@ -152,15 +165,15 @@ class ReviewTest < Minitest::Test
     assert_equal 3, evaluate("plan.entries.filter(e=>status(e)==='skip').length")
   end
 
-  def test_bulk_select_all_matching_and_new_ignores_non_purchase_and_locked
+  def test_bulk_select_all_matching_and_new_includes_fx_and_ignores_locked
     click('[data-filter="review"]')
     click("#check-page")
     assert_equal "2 selected", @browser.at_css("#bulk-count").text, "locked row is excluded from select-all"
     click('[data-bulk="new"]')
     assert_equal({ "action" => "new" }, evaluate("decisions['review-1']"))
-    assert_nil evaluate("decisions['fx-1']"), "FX rows need individual classification"
+    assert_equal({ "action" => "new" }, evaluate("decisions['fx-1']"), "FX rows import like purchases, uncategorized")
     assert_nil evaluate("decisions['locked-1']")
-    assert_includes @browser.at_css("#message").text, "1 skipped"
+    refute_includes @browser.at_css("#message").text, "skipped"
     click('[data-filter="all"]')
     @browser.execute("document.getElementById('search').value='review'; document.getElementById('search').dispatchEvent(new Event('input'))")
     click('tr[data-id="review-1"] input[type=checkbox]')

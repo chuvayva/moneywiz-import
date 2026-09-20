@@ -35,6 +35,7 @@ private/imports/<timestamp>-<run-id>/
   plan.json       Full comparison, source hashes, configuration, and decisions
   plan.csv        Spreadsheet version of all records and candidate matches
   plan.html       Self-contained offline review page with the plan embedded
+  decisions.json  Your saved review decisions; you save this from the page
 ```
 
 The terminal prints those paths. The page opens automatically. No server starts,
@@ -55,16 +56,14 @@ Choose an action and click **Save decision** in the transaction panel:
 | Match an existing entry | Associate this bank record with a displayed MoneyWiz candidate. No new app transaction. |
 | Skip — do not import | Exclude this bank record. After `apply`, the skip is remembered for future imports. Useful when a combined manual entry already covers it. |
 | Defer — review later | Leave the row on review for this plan. It is not imported. Future fresh imports reconsider it. |
-| Undo decision | Remove this draft decision, restoring the automatic classification; then save/resolve again. |
+| Undo decision | Remove this draft decision, restoring the automatic classification; then save again. |
 
 **Bulk actions.** Tick the checkbox on several rows, on any page and under any
 filter, then use the green bar above the table. The header checkbox selects the
 current page; **Select all N matching** extends the selection to every filtered
 record on all pages. Bulk **Skip**, **Defer**, **Import as new**, and **Undo
 decisions** ask for confirmation once and then write one draft decision per selected
-row. Bulk import only affects purchase rows that can be imported automatically and
-keeps the category shown in each row; FX, fees, and other non-purchase rows are
-reported as skipped so you can classify them individually. Locked rows have no
+row. Bulk import keeps the category shown in each row. Locked rows have no
 checkbox. The bar also has a category picker with **Set category**.
 
 **Categories.** Every importable record has a **Category** field at the top of its
@@ -88,66 +87,80 @@ an explicit decision. Use **Defer** if it must wait. Entries still marked
 The UI will not let you override an existing import marker, saved mapping, saved
 skip, or unresolved dispatch reservation. A fresh import checks that history again.
 
-Non-purchase rows require explicit classification as external income or expense.
-Do not classify transfers between your own accounts, FX, or cash withdrawals as
-income/expense. Automatic historical transfer creation is not implemented.
+Transfers, FX, and other non-purchase rows are proposed as **New** like purchases,
+but they are created uncategorized and titled with the bank row type: `Incoming
+Transfer`, `Outgoing Transfer`, or `FX`. The sign of the amount decides expense or
+income. The counterparty name from the statement is shown in the record panel.
+MoneyWiz transfers are not created automatically: convert those records into
+transfers, or recategorize them, in the app afterwards. Skip a row when it is
+already covered by an existing entry. A record whose title contains "transfer" is
+created without the `[bog-v1-…]` memo marker, since MoneyWiz prints the note next
+to the title and you are going to rework that record by hand anyway.
 
-### 3. Save the decisions file
+### 3. Save the decisions file next to the plan
 
-Click **Save decisions** in the header. Where supported, a file picker saves JSON
-at a location you choose. **Download JSON** always offers the download alternative.
-The suggested filename is `moneywiz-decisions-<run-id>.json`.
+Click **Save decisions** in the header. In Chrome a file picker opens with the
+suggested name `decisions.json`. Save it in this run's folder, next to `plan.json`.
+Then `apply` finds it on its own and no path needs to be typed or copied.
 
 The draft is cached in localStorage after each saved decision. Before closing the
-page, export the file: browsers cannot reliably save a file during tab shutdown.
-A reminder appears for unexported changes or an unfinished form. A browser cache
+page, save the file: browsers cannot reliably save a file during tab shutdown.
+A reminder appears for unsaved changes or an unfinished form. A browser cache
 is temporary recovery storage, not your durable import ledger.
 
-If the file downloads to Downloads, use its actual name and path. Browsers may
-append `(1)` on repeated downloads. The **Workflow & commands** tab has an editable
-field for the saved decisions path and generates correctly quoted commands.
+A page opened from disk cannot write to its own folder or see where a file went,
+so the picker has to be pointed at the run folder by hand. If the file ends up in
+Documents or Downloads instead, `apply` still finds it: a JSON file there that
+belongs to this exact plan is moved into the run folder and used. Safari and
+Firefox have no picker and download the file, which the same lookup covers. For
+any other location, set the path in the **Workflow & commands** tab, which then
+adds `--decisions` to the generated command, or pass the flag yourself.
 
-### 4. Resolve and inspect the final plan
-
-Copy the command from the workflow tab, or run:
-
-```sh
-moneywiz_import.rb resolve '/path/to/run/plan.json' --decisions '/path/to/moneywiz-decisions.json' --open
-```
-
-This validates the decisions, checks that the source XLSX files are unchanged,
-and compares everything against a fresh backup and ledger again. It writes
-`resolved.json`, `resolved.csv`, and `resolved.html` beside the input plan, then
-opens the resolved page. **Nothing is created in MoneyWiz yet.**
-
-Inspect **New** again: these are the transactions that will be created. If a
-candidate became ambiguous, it remains on review. You can make further decisions,
-save them, and resolve again. Exported files contain the complete decision set;
-loading/resolving one replaces the previous decision set rather than merging it.
-
-### 5. Apply
+### 4. Apply
 
 ```sh
-moneywiz_import.rb apply '/path/to/run/resolved.json'
+moneywiz_import.rb apply '/path/to/run/plan.json'
 ```
 
-This is the command that **creates real MoneyWiz transactions**. It:
+This is the command that **creates real MoneyWiz transactions**. MoneyWiz must
+already be open and finished syncing: URLs sent while the app is starting are
+silently dropped, so apply refuses to run when the app is not running and waits
+if it started less than 90 seconds ago. It reads `decisions.json` beside the plan
+when present, or the file given with `--decisions PATH`, and then:
 
 1. Checks source hashes and configuration, acquires the importer lock, and takes
    a fresh backup.
-2. Rechecks existing entries and remembers matched/skipped source identities in
-   `private/ledger.json`.
-3. Reconciles again immediately before each new entry, against the backup that
-   verified the previous save in this run.
-4. Durably reserves that entry, sends its MoneyWiz URL, and verifies the resulting
-   app record through a fresh backup before moving to the next one.
-5. Stops if a save cannot be confirmed. It does not blindly retry.
+2. Rebuilds the comparison against that backup and the ledger with your decisions
+   applied. Rows are New only if the review page showed them as New: rows you
+   marked **Import as new**, plus automatic proposals you left alone.
+3. Remembers matched/skipped source identities in `private/ledger.json`, along
+   with your merchant category answers.
+4. Reconciles again immediately before each new entry, against the backup that
+   verified the previous save in this run. A row that turned ambiguous stops the
+   run before anything is sent.
+5. Durably reserves that entry, sends its MoneyWiz URL, and verifies the resulting
+   app record through a fresh backup before moving to the next one. Transfers carry
+   no marker to search for, so they are recorded as imported without a MoneyWiz ID
+   and are not verified; check those in the app yourself.
+6. Stops if a save cannot be confirmed. It does not blindly retry.
 
 Review and deferred entries remain untouched. You can apply with zero New entries
-to persist confirmed matches/skips without creating any transactions.
+to persist confirmed matches/skips without creating any transactions. With no
+decisions file at all, the automatic New rows of the plan are applied as shown.
 
-If you changed no decisions and all automatically proposed New entries are
-correct, you can apply `plan.json` directly and omit the save/resolve steps.
+Decision files contain the complete decision set. Applying one replaces the plan's
+previous decisions rather than merging with them.
+
+### 5. Optional: preview before applying
+
+```sh
+moneywiz_import.rb resolve '/path/to/run/plan.json' --decisions '/path/to/run/decisions.json' --open
+```
+
+This runs the same recheck as `apply` without creating anything and writes
+`resolved.json`, `resolved.csv`, and `resolved.html` beside the plan. Use it when
+you want to see the final New list after the fresh backup, for example after a
+long pause between review and apply. You can then apply `plan.json` as above.
 
 ### 6. Next time
 
@@ -168,8 +181,9 @@ bound to their source-file hashes and will be rejected for different inputs.
 | `moneywiz_import.rb import FILE.xlsx [MORE.xlsx …]` | Fresh comparison; saves a separate run under `private/imports/` and opens its HTML page. | No |
 | `moneywiz_import.rb plan FILE.xlsx [MORE.xlsx …]` | Same comparison; writes `private/plan.json`, `.csv`, `.html` by default without opening a browser. | No |
 | `moneywiz_import.rb review [PLAN.json]` | Regenerates and opens HTML from a saved plan. No database access. Defaults to `private/plan.json`. | No |
-| `moneywiz_import.rb resolve PLAN.json --decisions FILE.json` | Validates the complete decision set against unchanged sources and a fresh backup; writes `resolved.*` beside the input. | No |
-| `moneywiz_import.rb apply PLAN.json` | Creates planned New entries via MoneyWiz URLs, verifies each save, and persists matches/skips. Requires an explicit plan path. | **Yes** |
+| `moneywiz_import.rb apply PLAN.json [--decisions FILE.json]` | Rechecks a fresh backup with your decisions, creates the reviewed New entries via MoneyWiz URLs, verifies each save, and persists matches/skips. Reads `decisions.json` beside the plan by default. Requires an explicit plan path. | **Yes** |
+| `moneywiz_import.rb resolve PLAN.json --decisions FILE.json` | Optional preview of the same recheck; writes `resolved.*` beside the input without creating anything. | No |
+| `moneywiz_import.rb release ID` | Clears a stuck `dispatching` reservation after confirming, through a fresh backup, that MoneyWiz holds no record marked with that ID. | Ledger only |
 | `moneywiz_import.rb accounts` | Lists account names, currencies, stable IDs, and archive state using a fresh backup. | No |
 | `moneywiz_import.rb --help` | Shows commands, defaults, and flags. `-h` is equivalent. | No |
 | `test_moneywiz_import.rb` | Runs importer tests using temporary databases and simulated URL delivery. | No |
@@ -181,7 +195,7 @@ bound to their source-file hashes and will be rejected for different inputs.
 | --- | --- | --- |
 | `--config PATH` | Database-backed commands | Use another configuration JSON. Default: `config.json` beside the script. |
 | `--snapshot PATH` | import, plan, resolve, accounts | Use an existing database backup instead of taking a fresh one. Useful offline; it may be stale. Apply always uses fresh snapshots. |
-| `--decisions PATH` | import, plan, resolve | Read a raw ID-to-decision JSON map or the UI's source-bound export, which also carries per-row categories and merchant rules. Required for resolve. |
+| `--decisions PATH` | import, plan, resolve, apply | Read a raw ID-to-decision JSON map or the UI's source-bound export, which also carries per-row categories and merchant rules. Required for resolve. Apply defaults to `decisions.json` beside the plan. |
 | `--out PATH.json` | import, plan, resolve | Choose the plan output path. CSV and HTML use the same stem. Resolve otherwise writes `resolved.json` beside its input. |
 | `--open` | import, plan, resolve, review | Open the generated HTML. Default for import and review. |
 | `--no-open` | import, plan, resolve, review | Generate files without opening a browser. |
@@ -227,8 +241,8 @@ indistinguishable repeated bank rows remain on review instead of disappearing.
 
 ### Apply a partial import
 
-Defer unresolved New entries, save decisions, resolve, and apply the resolved
-plan. Matched/skipped entries are remembered, and remaining review entries wait.
+Defer unresolved New entries, save decisions, and apply the plan. Matched/skipped
+entries are remembered, and remaining review entries wait.
 Later, reopen the plan and revise those decisions, or start a fresh import.
 
 ### Recover after interruption
@@ -238,13 +252,34 @@ error, nothing was sent for that row and no reservation exists. Rows verified
 earlier in the run are recognized by their markers, so you can simply run the same
 `apply` command again; it skips them and continues with the remaining New rows.
 
-If it stopped with "Save unconfirmed", run a new `import` with the same statement.
-If MoneyWiz saved after the timeout, its marker allows reconciliation. Otherwise
-the reservation remains locked on review. Do not delete the ledger or send the URL
-again: the prior outcome may be uncertain. There is no automatic reset/retry command.
+If it stopped with "Save unconfirmed", first look at MoneyWiz. If the record is
+there, run a new `import` with the same statement: its marker reconciles it. If the
+app shows no such record, for example because the app was not running when the URL
+was sent, clear the reservation with the ID from the error message:
+
+```sh
+moneywiz_import.rb release 'bog-v1-…'
+```
+
+Release rechecks a fresh backup for the marker and refuses when a record exists.
+Never edit the ledger by hand and never resend a URL manually.
 
 Transactions created by the importer, and MoneyWiz entries already matched or
-imported in the ledger, are never duplicate candidates for other bank rows.
+imported in the ledger, are never duplicate candidates for other bank rows. A
+memo marker alone is not treated as proof of authorship: MoneyWiz copies the memo
+when you duplicate a record or turn one into a transfer, so an entry whose marker
+does not fit its own account and amount stays available to the bank row it really
+covers.
+
+### Records you edited in MoneyWiz after importing them
+
+Editing an imported record is expected, and the next import keeps it out of the
+New list. Changing its amount or date, duplicating it, or converting it into a
+transfer (which replaces it with two legs under new IDs and may drop the memo) all
+leave the ledger as the durable proof that the row was created. Such rows stay
+**Matched**, with the reason "imported earlier; its MoneyWiz record was edited or
+removed since" when neither the marker nor the stored ID identifies the record any
+more. They are never proposed again.
 
 ### Already covered by a combined or split manual entry
 
@@ -261,10 +296,20 @@ moneywiz_import.rb accounts
 
 Use the exact active account names and matching currencies in `config.json`.
 The current mappings are `GEL → Solo ლ`, `USD → Solo $`, and `EUR → Solo €`.
-After changing mappings, generate a new import. `apply` rejects a changed config.
+`payees` lists merchants that should be saved with a MoneyWiz payee instead of a
+description: keys are the store name before the first comma in the bank's
+merchant field (case-insensitive, like merchant rules), values are the payee
+name, for example `"bolt taxi": "Bolt Taxi"`. MoneyWiz creates the payee if it
+does not exist; the record's description stays empty. All other merchants keep
+the merchant name as description and no payee. The record panel shows **Payee**
+for affected rows. After changing mappings or payees, generate a new import.
+`apply` rejects a plan whose `database`, `timezone`, `accounts`, `match_days`,
+`review_days`, or `payees` differ from the current config. Operational keys may change at any time:
+`verification_seconds` (default 60) is how long apply waits for each save to show
+up in a fresh backup; `app_process` (default none, set to `MoneyWiz`) names the
+process that must be running before apply sends anything; `keep_backups`
+(default 1) sets how many database backups stay in `private/backups/`.
 Use `--config '/path/to/config.json'` consistently for an alternative configuration.
-`keep_backups` (default 1) sets how many database backups stay in
-`private/backups/`; every database-backed command removes older ones.
 
 ### Work from a retained backup
 
@@ -298,13 +343,18 @@ project; if you move it, update those links. UI tests require Google Chrome;
   the URL omits category. MoneyWiz's own categorization preferences can still
   affect the saved category.
 - Created records get the merchant name as description and only the source marker
-  (`[bog-v1-…]`) as memo. The full bank text stays in the plan JSON/CSV.
+  (`[bog-v1-…]`) as memo, except records titled as a transfer, which get no memo.
+  Merchants listed under `payees` in `config.json` get that payee and an empty
+  description instead. The full bank text stays in the plan JSON/CSV.
 - Payment-service `payment code` values identify some bank rows. Card purchases
   use a SHA-256 fingerprint of bank account, currency, signed amount, purchase
   timestamp, full merchant, and card suffix. Filename and posting date are excluded
   from card fingerprints. Fallback rows use timestamp/date plus full description.
 - Matched source identities map to MoneyWiz's stable `ZGID`. Imported records carry
-  a source marker in the memo, supporting recovery without the ledger.
+  a source marker in the memo, supporting recovery without the ledger. When one
+  marker sits on several records, the single copy matching the row's account and
+  amount wins; the ledger decides when no copy does. Transfers have no marker at
+  all, so `private/ledger.json` is the only thing keeping them off the New list.
 - If bank amounts/descriptions change enough to alter a fingerprint, reconciliation
   still runs. Without true bank IDs, perfect automatic matching is not guaranteed.
 

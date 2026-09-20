@@ -19,6 +19,9 @@ class MoneyWizImportTest < Minitest::Test
     @account = { "pk" => 1, "gid" => "account-1", "name" => "Solo ლ", "currency" => "GEL", "archived" => false }
   end
 
+  # Real bank IDs; the importer only treats a memo as its own marker in this form.
+  MARKED_IDS = ["bog-v1-#{'a' * 64}-1", "bog-v1-#{'b' * 64}-1"].freeze
+
   def bank(id: "bank1", amount: -1000, date: "2026-09-01", **extra)
     { "id" => id, "account" => "Solo ლ", "currency" => "GEL", "cents" => amount, "occurred" => "#{date} 12:00:00", "posted" => date,
       "merchant" => "Shop, Tbilisi", "payee" => "Shop", "description" => "Bank description & details", "kind" => "Payment", "indistinguishable_count" => 1, "row" => 2 }.merge(extra.transform_keys(&:to_s))
@@ -90,6 +93,25 @@ class MoneyWizImportTest < Minitest::Test
     refute_includes url, "+"
   end
 
+  def test_listed_merchants_get_a_payee_instead_of_a_description
+    @config["payees"] = { "Bolt Taxi" => " Bolt Taxi " }
+    entries = plan([bank(id: "b1", merchant: "BOLT TAXI, Tbilisi, 142 beliashvili str", payee: "BOLT TAXI"),
+                    bank(id: "b2", merchant: "Nikora, Tbilisi", payee: "Nikora"),
+                    bank(id: "b3", kind: "Outgoing Transfer", payee: "Outgoing Transfer", merchant: "bolt taxi, x")], [])
+    assert_equal "Bolt Taxi", entries[0]["moneywiz_payee"]
+    refute entries[1].key?("moneywiz_payee")
+    refute entries[2].key?("moneywiz_payee"), "only purchases get payees"
+    params = URI.decode_www_form(URI(M.url(entries[0].merge("status" => "new"))).query).to_h
+    assert_equal "Bolt Taxi", params["payee"]
+    refute params.key?("description")
+    assert_equal "[b1]", params["memo"]
+    plain = URI.decode_www_form(URI(M.url(entries[1].merge("status" => "new"))).query).to_h
+    assert_equal "Nikora", plain["description"]
+    refute plain.key?("payee")
+    assert_raises(M::Error) { M.validate_payees("bolt taxi" => "") }
+    assert_raises(M::Error) { M.validate_payees(["bolt taxi"]) }
+  end
+
   def test_title_and_posting_date_can_differ
     result = plan([bank(posted: "2026-09-04")], [transaction(date: "2026-08-31", description: "Something else")])
     assert_equal "existing", result.first["status"]
@@ -127,11 +149,47 @@ class MoneyWizImportTest < Minitest::Test
     assert_includes result.first["reason"], "split"
   end
 
-  def test_non_purchases_need_explicit_classification
-    %w[FX Withdrawal Income].each { |kind| assert_equal "review", plan([bank(kind: kind)], []).first["status"] }
-    assert_raises(M::Error) { plan([bank(kind: "Incoming Transfer", amount: 1000)], [], decisions: { "bank1" => { "action" => "new" } }) }
-    entry = plan([bank(kind: "Incoming Transfer", amount: 1000)], [], decisions: { "bank1" => { "action" => "new", "operation" => "income" } }).first
-    assert M.url(entry).start_with?("moneywiz://income?")
+  def test_non_purchases_are_created_uncategorized_and_titled_by_kind
+    %w[FX Withdrawal Income].each do |kind|
+      entry = plan([bank(kind: kind, payee: kind, merchant: "Shop, Tbilisi")], [], rules: { "shop" => { "category" => "Cafe", "always" => true } }).first
+      assert_equal "new", entry["status"]
+      assert_nil entry["category"], "no rule or learned category applies to #{kind}"
+    end
+    entry = plan([bank(kind: "Incoming Transfer", payee: "Incoming Transfer", merchant: nil, amount: 1000)], [], decisions: { "bank1" => { "action" => "new" } }).first
+    url = M.url(entry)
+    assert url.start_with?("moneywiz://income?")
+    assert_includes url, "description=Incoming%20Transfer"
+    refute_includes url, "category="
+    chosen = plan([bank(kind: "FX")], [], decisions: { "bank1" => { "action" => "new" } }, categories: { "bank1" => "Cafe" }).first
+    assert_equal "Cafe", chosen["category"], "an explicit per-row choice still applies"
+    assert_raises(M::Error) { plan([bank(kind: "FX")], [], decisions: { "bank1" => { "action" => "new", "operation" => "income" } }) }
+  end
+
+  def test_transfers_are_created_without_a_memo_marker
+    transfer = plan([bank(kind: "Outgoing Transfer", payee: "Outgoing Transfer", merchant: nil)], [], decisions: { "bank1" => { "action" => "new" } }).first
+    refute_includes M.url(transfer), "memo=", "a title MoneyWiz shows as a transfer stays clean"
+    assert_nil M.memo(transfer)
+    %w[FX Income Withdrawal].each do |kind|
+      other = plan([bank(kind: kind, payee: kind, merchant: nil)], [], decisions: { "bank1" => { "action" => "new" } }).first
+      assert_includes M.url(other), "memo=%5Bbank1%5D", "#{kind} is not titled as a transfer and keeps its marker"
+    end
+    purchase = plan([bank], [], decisions: { "bank1" => { "action" => "new" } }).first
+    assert_includes M.url(purchase), "memo=%5Bbank1%5D"
+  end
+
+  def test_applying_a_transfer_records_it_without_a_gid_and_never_repeats_it
+    transfer = bank(kind: "Outgoing Transfer", payee: "Outgoing Transfer", merchant: nil)
+    with_fake_application(banks: [transfer]) do |dir, plan, calls, snapshots, opener|
+      runner = M::Runner.new(@config, state_path: File.join(dir, "ledger.json"), snapshotter: snapshots, opener: opener)
+      plan = plan.merge("entries" => [transfer.merge("status" => "new")])
+      capture_io { runner.apply(plan); runner.apply(plan) }
+      assert_equal 1, calls.size, "the ledger alone keeps it from being sent twice"
+      refute_includes calls.first, "memo="
+      assert_equal({ "status" => "imported" }, runner.ledger["bank1"])
+      # A later import sees no marker and no GID, and still keeps the row off New.
+      entry = plan([transfer], [], ledger: runner.ledger).first
+      assert_equal "existing", entry["status"]
+    end
   end
 
   def test_interrupted_dispatch_never_retries_even_with_old_new_decision
@@ -140,10 +198,45 @@ class MoneyWizImportTest < Minitest::Test
     assert_includes entry["reason"], "never automatically retry"
   end
 
-  def test_marker_recovers_after_lost_ledger_but_wrong_date_does_not
+  def test_marker_recovers_after_lost_ledger_and_survives_edits_and_copies
     assert_equal "existing", plan([bank], [transaction(memo: "[bank1]")]).first["status"]
-    assert_equal "review", plan([bank], [transaction(memo: "[bank1]", date: "2026-08-20")]).first["status"]
+    # Dates get corrected in MoneyWiz; account and amount still identify the record.
+    assert_equal "existing", plan([bank], [transaction(memo: "[bank1]", date: "2026-08-20")]).first["status"]
+    # Converting a record into a transfer leaves the memo on both legs; only one is this row.
+    legs = [transaction(id: "out", amount: -1000, memo: "[bank1]"), transaction(id: "in", amount: 2600, memo: "[bank1]")]
+    assert_equal ["existing", "out"], plan([bank], legs).first.values_at("status", "match_gid")
+    # Nothing tells two equally plausible copies apart.
     assert_equal "review", plan([bank], [transaction(id: "a", memo: "[bank1]"), transaction(id: "b", memo: "[bank1]")]).first["status"]
+    conflicting = plan([bank], [transaction(memo: "[bank1]", amount: -4200)]).first
+    assert_equal "review", conflicting["status"]
+    assert_includes conflicting["reason"], "marker conflicts"
+  end
+
+  def test_imported_row_stays_existing_after_its_record_is_edited_or_removed
+    ledger = { "bank1" => { "status" => "imported", "gid" => "gone" } }
+    entry = plan([bank], [], ledger: ledger).first
+    assert_equal "existing", entry["status"], "never propose a row this importer already created"
+    assert_includes entry["reason"], "edited or removed"
+    assert_nil entry["match_gid"]
+    edited = plan([bank], [transaction(id: "gone", amount: -2400)], ledger: ledger).first
+    assert_equal "existing", edited["status"]
+    # A row still awaiting confirmation is a different matter and stays on review.
+    dispatching = plan([bank], [], ledger: { "bank1" => { "status" => "dispatching" } }).first
+    assert_equal "review", dispatching["status"]
+    matched_gone = plan([bank], [], ledger: { "bank1" => { "status" => "matched", "gid" => "gone" } }).first
+    assert_equal "review", matched_gone["status"]
+  end
+
+  def test_entry_carrying_a_copied_marker_still_matches_its_own_bank_row
+    first, second = MARKED_IDS
+    # The user duplicated an imported record, so an entry of another amount inherited its memo.
+    copy = transaction(id: "copy", amount: -2500, memo: "[#{first}]")
+    entries = plan([bank(id: first), bank(id: second, amount: -2500)], [transaction(memo: "[#{first}]"), copy])
+    assert_equal %w[existing existing], entries.map { |e| e["status"] }
+    assert_equal %w[app1 copy], entries.map { |e| e["match_gid"] }
+    # A marker whose row is absent from this statement still shields its record.
+    foreign = plan([bank(id: second, amount: -2500)], [transaction(id: "copy", amount: -2500, memo: "[#{first}]")]).first
+    assert_equal "new", foreign["status"]
   end
 
   def test_identical_rows_never_silently_collapse
@@ -225,6 +318,28 @@ class MoneyWizImportTest < Minitest::Test
     end
   end
 
+  def test_locate_decisions_prefers_run_folder_then_adopts_a_matching_stray
+    Dir.mktmpdir do |dir|
+      run, docs = File.join(dir, "run"), File.join(dir, "Documents")
+      FileUtils.mkdir_p(run)
+      FileUtils.mkdir_p(docs)
+      plan = { "id" => "abc" }
+      assert_nil M::CLI.locate_decisions(plan, run, search: [docs])
+      File.write(File.join(docs, "decisions.json"), JSON.generate("type" => "moneywiz-decisions", "plan_id" => "abc", "decisions" => {}))
+      File.write(File.join(docs, "other.json"), JSON.generate("plan_id" => "zzz"))
+      File.write(File.join(docs, "broken.json"), "{")
+      found = capture_io { @found = M::CLI.locate_decisions(plan, run, search: [docs]) }
+      assert_equal File.join(run, "decisions.json"), @found
+      assert_includes found.last, "Adopting"
+      refute File.exist?(File.join(docs, "decisions.json")), "the stray file is moved, not copied"
+      assert_equal File.join(run, "decisions.json"), M::CLI.locate_decisions(plan, run, search: [docs])
+      File.write(File.join(docs, "a.json"), JSON.generate("plan_id" => "abc"))
+      File.write(File.join(docs, "b.json"), JSON.generate("plan_id" => "abc"))
+      FileUtils.rm(File.join(run, "decisions.json"))
+      assert_raises(M::Error) { M::CLI.locate_decisions(plan, run, search: [docs]) }
+    end
+  end
+
   def test_lock_prevents_concurrent_importers_and_ledger_is_durable
     Dir.mktmpdir do |dir|
       runner = M::Runner.new(@config, state_path: File.join(dir, "ledger.json"))
@@ -244,6 +359,10 @@ class MoneyWizImportTest < Minitest::Test
     assert_equal first.map { |e| e["id"] }, both.map { |e| e["id"] }
     assert_equal 488, both.size
     assert both.any? { |e| e["kind"] == "FX" && e["description"].start_with?("Payment") }
+    transfers = both.reject { |e| e["kind"] == "Payment" }
+    refute_empty transfers
+    assert transfers.all? { |e| e["payee"] == e["kind"] }, "non-purchases are titled by their bank row type"
+    assert transfers.any? { |e| e["kind"].end_with?("Transfer") && e["counterparty"] }
     assert both.any? { |e| e["bank_payment_code"] }
   end
 
@@ -266,7 +385,7 @@ class MoneyWizImportTest < Minitest::Test
         calls << url
         params = URI.decode_www_form(URI(url).query).to_h
         db.execute("INSERT INTO ZSYNCOBJECT (Z_PK,Z_ENT,ZGID,ZACCOUNT2,ZDATE1,ZAMOUNT1,ZDESC2,ZNOTES1) VALUES (?,48,?,1,?,?,?,?)",
-                   [calls.size + 1, "created-#{calls.size}", Time.local(2026, 9, 1, 12).to_i - 978_307_200, params.fetch("amount").to_f * -1, params.fetch("description"), params.fetch("memo")])
+                   [calls.size + 1, "created-#{calls.size}", Time.local(2026, 9, 1, 12).to_i - 978_307_200, params.fetch("amount").to_f * -1, params.fetch("description"), params["memo"].to_s])
       end
       M::CLI.stub(:load_bank, banks) do
         yield dir, plan, calls, snapshots, save_in_fake_app
@@ -301,6 +420,35 @@ class MoneyWizImportTest < Minitest::Test
     end
   end
 
+  def test_apply_with_decisions_file_creates_decided_new_rows_and_honors_defer
+    second = bank(id: "bank2", amount: -2000)
+    with_fake_application(banks: [bank, second]) do |dir, plan, calls, snapshots, opener|
+      runner = M::Runner.new(@config, state_path: File.join(dir, "ledger.json"), snapshotter: snapshots, opener: opener)
+      # The page showed bank1 on review and bank2 as New; the reviewer marked bank1 new and deferred bank2.
+      plan = plan.merge("entries" => [bank(status: "review", reason: "ambiguous"), second.merge("status" => "new")])
+      decisions = { "decisions" => { "bank1" => { "action" => "new" }, "bank2" => { "action" => "defer" } },
+                    "category_overrides" => {}, "merchant_rules" => { "shop" => { "category" => "Groceries", "always" => false } } }
+      capture_io { runner.apply(plan, decisions) }
+      assert_equal 1, calls.size
+      assert_includes calls.first, "memo=%5Bbank1%5D"
+      assert_equal "created-1", runner.ledger.dig("bank1", "gid")
+      assert_nil runner.ledger["bank2"], "deferred rows are neither created nor remembered"
+      assert_equal false, runner.merchant_rules.dig("shop", "always")
+    end
+  end
+
+  def test_apply_with_decisions_file_rejects_unknown_ids_and_skips_decided_rows
+    with_fake_application do |dir, plan, calls, snapshots, opener|
+      runner = M::Runner.new(@config, state_path: File.join(dir, "ledger.json"), snapshotter: snapshots, opener: opener)
+      stray = { "decisions" => { "other" => { "action" => "skip" } }, "category_overrides" => {}, "merchant_rules" => {} }
+      assert_raises(M::Error) { runner.apply(plan, stray) }
+      skip = { "decisions" => { "bank1" => { "action" => "skip" } }, "category_overrides" => {}, "merchant_rules" => {} }
+      capture_io { runner.apply(plan, skip) }
+      assert_empty calls
+      assert_equal "skipped", runner.ledger.dig("bank1", "status")
+    end
+  end
+
   def test_apply_persists_merchant_rules_including_declined_answers
     with_fake_application do |dir, plan, calls, snapshots, opener|
       runner = M::Runner.new(@config, state_path: File.join(dir, "ledger.json"), snapshotter: snapshots, opener: opener)
@@ -313,6 +461,28 @@ class MoneyWizImportTest < Minitest::Test
       assert_equal false, rules.dig("wolt", "always"), "plan answers replace older ones"
       assert_equal "Groceries", rules.dig("nikora", "category")
       assert_equal "created-1", runner.ledger.dig("bank1", "gid")
+    end
+  end
+
+  def test_apply_refuses_when_the_app_is_not_running_and_release_clears_a_dead_reservation
+    with_fake_application do |dir, plan, calls, snapshots, opener|
+      config = @config.merge("app_process" => "NoSuchProcess#{Process.pid}", "verification_seconds" => 5)
+      runner = M::Runner.new(config, state_path: File.join(dir, "ledger.json"), snapshotter: snapshots, opener: opener)
+      error = assert_raises(M::Error) { runner.apply(plan) }
+      assert_includes error.message, "not running", "operational config keys do not invalidate the plan"
+      assert_empty calls
+      other = M::Runner.new(@config.merge("match_days" => 9), state_path: File.join(dir, "ledger.json"), snapshotter: snapshots, opener: opener)
+      assert_includes assert_raises(M::Error) { other.apply(plan) }.message, "match_days"
+      # A reservation left by a lost URL is released only when the app is up and holds no marked record.
+      runner.save({ "bank1" => { "status" => "dispatching", "at" => "2026-09-11T23:08:40Z" } }, {})
+      assert_raises(M::Error) { runner.release("bank1") }
+      running = M::Runner.new(@config, state_path: File.join(dir, "ledger.json"), snapshotter: snapshots, opener: opener)
+      capture_io { running.release("bank1") }
+      assert_nil running.ledger["bank1"]
+      assert_raises(M::Error) { running.release("bank1") }
+      capture_io { running.apply(plan) }
+      assert_equal 1, calls.size
+      assert_raises(M::Error, "imported rows are never released") { running.release("bank1") }
     end
   end
 

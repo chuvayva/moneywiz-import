@@ -1,8 +1,18 @@
 {
   "database": "~/Library/Containers/com.moneywiz.personalfinance/Data/Library/Application Support/MoneyWiz_iCloud.sqlite",
   "timezone": "Asia/Tbilisi",
-  "accounts": {"GEL": "Solo ლ", "USD": "Solo $", "EUR": "Solo €"},
+  "accounts": {
+    "GEL": "Solo ლ",
+    "USD": "Solo $",
+    "EUR": "Solo €"
+  },
+  "payees": {
+    "bolt taxi": "Bolt Taxi",
+    "ce la vi": "ce la vi",
+    "dunkin'": "Dunkin'"
+  },
   "match_days": 5,
   "review_days": 10,
-  "verification_seconds": 20
+  "verification_seconds": 60,
+  "app_process": "MoneyWiz"
 }

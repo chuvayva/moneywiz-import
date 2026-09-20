@@ -57,6 +57,17 @@ module MoneyWizImport
     rules
   end
 
+  # Payee names: normalized store name (before the first comma) => MoneyWiz payee.
+  # Listed merchants are saved with that payee and an empty description.
+  def self.validate_payees(payees)
+    raise Error, "payees must be an object" unless payees.is_a?(Hash)
+    payees.each do |key, name|
+      valid = key.is_a?(String) && !key.empty? && name.is_a?(String) && !name.strip.empty?
+      raise Error, "Invalid payee for #{key.inspect}" unless valid
+    end
+    payees.to_h { |key, name| [normalize(key), name.strip] }
+  end
+
   def self.validate_overrides(overrides)
     raise Error, "Category overrides must be an object" unless overrides.is_a?(Hash)
     overrides.each do |id, category|
@@ -116,7 +127,9 @@ module MoneyWizImport
     def self.prune(directory, keep:)
       raise Error, "keep_backups must be a positive integer" unless keep.is_a?(Integer) && keep.positive?
       return unless Dir.exist?(directory)
-      kept = Dir.children(directory).grep(NAME).sort.last(keep)
+      # Order by write time: names carry seconds only, so two copies taken in the
+      # same second would otherwise be ranked by their random suffix.
+      kept = Dir.children(directory).grep(NAME).sort_by { |name| [File.mtime(File.join(directory, name)), name] }.last(keep)
       Dir.children(directory).each do |name|
         base = name.sub(/-(wal|shm|journal)\z/, "")
         next unless base.match?(NAME) && !kept.include?(base)
@@ -179,7 +192,12 @@ module MoneyWizImport
         stamp = description[/\bDate: (\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}(?::\d{2})?)/, 1]
         occurred = stamp ? DateTime.strptime(stamp, stamp.length == 19 ? "%d/%m/%Y %H:%M:%S" : "%d/%m/%Y %H:%M").strftime("%Y-%m-%d %H:%M:%S") : "#{posted} 12:00:00"
         merchant = description[/Merchant: ([^;]+)/, 1]&.strip
-        payee = merchant&.split(",")&.first || description[/(?:Sender|Beneficiary): ([^;]+)/, 1] || description.split(" - ").first
+        counterparty = description[/(?:Sender|Beneficiary): ([^;]+)/, 1]&.strip
+        kind = description.include?("Foreign Exchange") ? "FX" : description.split(" - ").first
+        # Purchases are titled by merchant. Transfers, FX and other non-purchases
+        # keep the bank's row type as their MoneyWiz description, uncategorized,
+        # so they are easy to find and reclassify in the app later.
+        payee = kind == "Payment" ? merchant&.split(",")&.first || counterparty || kind : kind
         currencies.filter_map do |column, currency|
           next if row[column].to_s.empty?
           amount = MoneyWizImport.cents(row[column])
@@ -196,8 +214,8 @@ module MoneyWizImport
           fingerprint = Digest::SHA256.hexdigest(JSON.generate(identity))
           { "fingerprint" => fingerprint, "currency" => currency, "cents" => amount,
             "posted" => posted, "occurred" => occurred, "merchant" => merchant,
-            "payee" => payee, "description" => description, "row" => row["_row"],
-            "source" => @path, "kind" => description.include?("Foreign Exchange") ? "FX" : description.split(" - ").first,
+            "payee" => payee, "counterparty" => counterparty, "description" => description, "row" => row["_row"],
+            "source" => @path, "kind" => kind,
             "bank_payment_code" => payment_code }
         end
       end
@@ -269,6 +287,7 @@ module MoneyWizImport
     def initialize(bank, reference, config, ledger: {}, decisions: {}, categories: {}, rules: {})
       @bank, @reference, @config, @ledger, @decisions = bank, reference, config, ledger, decisions
       @categories, @rules = categories, MoneyWizImport.validate_rules(rules)
+      @payees = MoneyWizImport.validate_payees(config.fetch("payees", {}))
       @aliases = {}
     end
 
@@ -284,6 +303,8 @@ module MoneyWizImport
       rule = @rules[Planner.merchant_key(b)]
       if @categories.key?(b["id"])
         [@categories[b["id"]], "decision"]
+      elsif b["kind"] != "Payment"
+        [nil, nil] # transfers and FX stay uncategorized unless chosen per row
       elsif rule && rule["always"] && rule["category"]
         [rule["category"], "rule"]
       elsif (learned = @aliases.dig(MoneyWizImport.normalize(b["merchant"]), "category"))
@@ -301,17 +322,53 @@ module MoneyWizImport
       b["account"] == t["account"] && b["currency"] == t["currency"]
     end
 
-    MARKER = /\[bog-v1-[0-9a-f]{64}-\d+\]/
+    MARKER = /\[(bog-v1-[0-9a-f]{64}-\d+)\]/
 
     # Transactions already claimed by another bank row are never candidates:
     # rows created by this importer carry a marker, and matched/imported rows
     # are recorded in the ledger. Without this, the second purchase at the same
     # merchant would be flagged as a duplicate of the first one created moments before.
+    #
+    # A marker alone does not prove authorship: MoneyWiz copies the memo when a
+    # record is duplicated or turned into a transfer, so an entry the user wrote
+    # by hand can carry someone else's marker. Such a copy stays a candidate
+    # unless its marker fits it, or belongs to a row outside this statement;
+    # otherwise the bank row it really covers would be proposed as new.
     def pool
       @pool ||= begin
         claimed = @ledger.values.filter_map { |r| r["gid"] if %w[matched imported].include?(r["status"]) }.to_h { |gid| [gid, true] }
-        @reference.transactions.reject { |t| claimed[t["gid"]] || "#{t['description']} #{t['memo']}".match?(MARKER) }
+        owners = @bank.to_h { |b| [b["id"], b] }
+        @reference.transactions.reject do |t|
+          next true if claimed[t["gid"]]
+          "#{t['description']} #{t['memo']}".scan(MARKER).flatten.any? { |id| !owners.key?(id) || marker_fits?(owners[id], t) }
+        end
       end
+    end
+
+    # A record created by this importer stays editable in MoneyWiz. Converting one
+    # into a transfer replaces it with two legs that both inherit the memo, and
+    # duplicating a record copies the memo as well, so one marker can appear on
+    # several transactions. Accept the single copy that still carries this row's
+    # account, amount and date; failing that, the single one with its account and
+    # amount, so an edited date does not hide a record we know about.
+    def resolve_marker(b, mark)
+      dated = mark.select { |t| marker_fits?(b, t) && t["date"] == b["occurred"][0, 10] }
+      return dated.first if dated.size == 1
+      undated = mark.select { |t| marker_fits?(b, t) }
+      undated.first if undated.size == 1
+    end
+
+    def marker_fits?(b, t)
+      same_account?(b, t) && b["cents"] == t["cents"]
+    end
+
+    # The transaction a remembered match or import still points at, when it is
+    # there and consistent with the bank row.
+    def mapped_transaction(b, remembered)
+      t = @reference.transactions.find { |x| x["gid"] == remembered["gid"] }
+      return nil unless t && same_account?(b, t)
+      return t if t["cents"] == b["cents"]
+      t if remembered["bank_cents"] == b["cents"] && remembered["matched_cents"] == t["cents"]
     end
 
     def exact_candidates(b, days)
@@ -362,22 +419,27 @@ module MoneyWizImport
         category, category_source = resolve_category(b)
         raise Error, "Unknown category #{category} for #{b['id']}" if category && !@reference.category_paths.value?(category)
         entry = b.merge("candidates" => edges[b["id"]], "category" => category, "category_source" => category_source)
+        entry["moneywiz_payee"] = @payees[Planner.merchant_key(b)] if b["kind"] == "Payment" && @payees.key?(Planner.merchant_key(b))
         mark = @reference.marker(b["id"])
+        marked = resolve_marker(b, mark)
         remembered = @ledger[b["id"]]
-        if mark.size == 1 && same_account?(b, mark.first) && b["cents"] == mark.first["cents"] && mark.first["date"] == b["occurred"][0, 10]
-          entry.merge("status" => "existing", "reason" => "import marker", "match_gid" => mark.first["gid"])
+        mapped = remembered && mapped_transaction(b, remembered)
+        if marked
+          entry.merge("status" => "existing", "reason" => "import marker", "match_gid" => marked["gid"])
+        elsif remembered && remembered["status"] == "skipped"
+          entry.merge("status" => "skip", "reason" => "saved skip decision")
+        elsif mapped
+          entry.merge("status" => "existing", "reason" => "saved mapping", "match_gid" => mapped["gid"])
+        elsif remembered && remembered["status"] == "imported"
+          # This row was created and verified in an earlier apply. The app record has
+          # since been edited, converted into a transfer, or deleted, so neither its
+          # GID nor its marker identifies it any more. The ledger is still proof that
+          # it was created: proposing it again would duplicate the transaction.
+          entry.merge("status" => "existing", "reason" => "imported earlier; its MoneyWiz record was edited or removed since")
         elsif !mark.empty?
           entry.merge("status" => "review", "reason" => "marker conflicts with account/amount or appears more than once")
         elsif remembered
-          gid = remembered["gid"]
-          t = @reference.transactions.find { |x| x["gid"] == gid }
-          if remembered["status"] == "skipped"
-            entry.merge("status" => "skip", "reason" => "saved skip decision")
-          elsif t && same_account?(b, t) && (t["cents"] == b["cents"] || remembered["bank_cents"] == b["cents"] && remembered["matched_cents"] == t["cents"])
-            entry.merge("status" => "existing", "reason" => "saved mapping", "match_gid" => gid)
-          else
-            entry.merge("status" => "review", "reason" => "previous dispatch or mapping unresolved; never automatically retry")
-          end
+          entry.merge("status" => "review", "reason" => "previous dispatch or mapping unresolved; never automatically retry")
         elsif b["indistinguishable_count"] > 1
           entry.merge("status" => "review", "reason" => "indistinguishable bank rows; ordinal is not a true bank ID")
         elsif b["account"].nil?
@@ -407,7 +469,7 @@ module MoneyWizImport
       # A manual entry can combine several bank charges (e.g. purchase + FX fee,
       # or several ATM withdrawals). Surface these BEFORE calling anything new.
       groups = entries.group_by do |e|
-        [e["account"], e["currency"], e["occurred"][0, 10], e["kind"], MoneyWizImport.normalize(e["merchant"] || e["payee"])]
+        [e["account"], e["currency"], e["occurred"][0, 10], e["kind"], MoneyWizImport.normalize(e["merchant"] || e["counterparty"] || e["payee"])]
       end
       groups.each_value do |group|
         next unless group.size.between?(2, 10)
@@ -462,7 +524,7 @@ module MoneyWizImport
       if !entry["candidates"].empty?
         entry.merge("status" => "review", "reason" => "possible duplicate: date, amount, title, or competing match")
       elsif entry["kind"] != "Payment"
-        entry.merge("status" => "review", "reason" => "transfer, cash, FX, refund or other non-purchase needs classification")
+        entry.merge("status" => "new", "reason" => "#{entry['kind']}: created uncategorized with that title; adjust in MoneyWiz later")
       else
         entry.merge("status" => "new", "reason" => "no plausible existing transaction")
       end
@@ -487,9 +549,6 @@ module MoneyWizImport
           entry.merge!("status" => "existing", "match_gid" => t["gid"], "reason" => "explicit match decision")
         when "new"
           operation = decision["operation"]
-          if entry["kind"] != "Payment" && !%w[income expense].include?(operation)
-            raise Error, "Classify non-purchase #{entry['id']} explicitly with operation income/expense; internal transfers must remain on review"
-          end
           expected = entry["cents"].negative? ? "expense" : "income"
           raise Error, "Operation conflicts with bank amount sign" if operation && operation != expected
           raise Error, "Cannot override indistinguishable rows" if entry["indistinguishable_count"] > 1
@@ -506,19 +565,36 @@ module MoneyWizImport
     end
   end
 
+  # MoneyWiz prints the note right after the title, so a marker on a record titled
+  # "Outgoing Transfer" is pure clutter — and those are exactly the records you
+  # convert into real transfers by hand afterwards, which scatters or drops the
+  # memo anyway. Transfers are left unmarked and recognized through the ledger.
+  def self.memo(entry)
+    title = entry["moneywiz_payee"] || entry["payee"].to_s
+    "[#{entry.fetch('id')}]" unless title.match?(/transfer/i)
+  end
+
   def self.url(entry)
-    raise Error, "Only new, classified transactions can be created" unless entry["status"] == "new" && (entry["kind"] == "Payment" || %w[income expense].include?(entry["operation"]))
+    raise Error, "Only new transactions can be created" unless entry["status"] == "new"
     params = { "account" => entry.fetch("account").gsub(/[[:space:]]/, ""), "amount" => money(entry.fetch("cents").abs),
                "currency" => entry.fetch("currency"), "date" => entry.fetch("occurred"), "save" => "true",
-               # Only the merchant name and the source marker; the bank's full text stays in the plan.
-               "description" => entry.fetch("payee").to_s, "memo" => "[#{entry.fetch('id')}]" }
+               # Only the merchant name; the bank's full text stays in the plan.
+               "description" => entry.fetch("payee").to_s }
+    params["memo"] = memo(entry) if memo(entry)
     params["category"] = entry["category"] if entry["category"]
-    # Do not create hundreds of payees from bank merchant spelling variations.
+    # Payees are created only for merchants listed in config "payees"; otherwise the
+    # merchant name is the description, so bank spelling variations do not multiply payees.
+    if entry["moneywiz_payee"]
+      params["payee"] = entry["moneywiz_payee"]
+      params.delete("description")
+    end
     query = URI.encode_www_form(params).gsub("+", "%20")
     "moneywiz://#{entry['cents'].negative? ? 'expense' : 'income'}?#{query}"
   end
 
   class Runner
+    PLAN_CONFIG_KEYS = %w[database timezone accounts match_days review_days payees].freeze
+
     def initialize(config, state_path: File.join(PRIVATE, "ledger.json"), snapshotter: nil, opener: nil)
       @config, @state_path = config, state_path
       @snapshotter = snapshotter || -> { Snapshot.take(@config.fetch("database")) }
@@ -544,6 +620,40 @@ module MoneyWizImport
       MoneyWizImport.write_json(@state_path, { "version" => 1, "entries" => entries, "merchant_categories" => rules || merchant_rules })
     end
 
+    # URLs sent while MoneyWiz is starting are dropped, and the URL itself would
+    # launch the app. Apply only talks to an app that has been running for a while.
+    def require_running_app(settle_seconds: 90)
+      name = @config["app_process"]
+      return unless name
+      pid = `pgrep -x #{name}`.split.first
+      raise Error, "#{name} is not running. Open it, wait until it finished syncing, then run apply again." unless pid
+      elapsed = `ps -o etime= -p #{pid}`.strip.split(/[-:]/).map(&:to_i)
+      seconds = elapsed.reverse.each_with_index.sum { |v, i| v * [1, 60, 3600, 86_400].fetch(i) }
+      if seconds < settle_seconds
+        puts "#{name} started #{seconds}s ago; waiting #{settle_seconds - seconds}s for it to settle."
+        sleep(settle_seconds - seconds)
+      end
+    end
+
+    # Clears a "dispatching" reservation whose URL provably never produced a
+    # record: MoneyWiz is running, and a fresh backup has no marker for the row.
+    def release(id)
+      with_lock do
+        state = ledger
+        entry = state[id]
+        raise Error, "No reservation for #{id}" unless entry
+        raise Error, "#{id} is #{entry['status']}, not dispatching; nothing to release" unless entry["status"] == "dispatching"
+        require_running_app(settle_seconds: 0)
+        snapshot = @snapshotter.call
+        Snapshot.prune(File.dirname(snapshot), keep: @config.fetch("keep_backups", 1))
+        marks = Reference.new(snapshot).marker(id)
+        raise Error, "MoneyWiz has #{marks.size} record(s) marked [#{id}]; run a fresh import to reconcile instead" unless marks.empty?
+        state.delete(id)
+        save(state)
+        puts "Released #{id}; the row returns to automatic classification on the next import."
+      end
+    end
+
     def with_lock
       FileUtils.mkdir_p(File.dirname(@state_path), mode: 0o700)
       File.open("#{@state_path}.lock", File::RDWR | File::CREAT, 0o600) do |file|
@@ -552,27 +662,51 @@ module MoneyWizImport
       end
     end
 
-    def apply(plan)
+    # Without a decisions file the plan is applied as displayed: only its New rows.
+    # With one (the UI export, complete decision set), the plan's automatic result
+    # is combined with those decisions exactly as the review page displayed them,
+    # and the recheck against a fresh backup replaces the separate resolve step.
+    def apply(plan, decision_file = nil)
       with_lock do
-        raise Error, "Configuration changed; regenerate plan" unless plan.fetch("config") == @config
+        # Operational settings (timeouts, backups, app name) may change between review and apply.
+        changed = PLAN_CONFIG_KEYS.reject { |k| plan.fetch("config")[k] == @config[k] }
+        raise Error, "Configuration changed (#{changed.join(', ')}); regenerate plan" unless changed.empty?
         plan.fetch("sources").each do |source|
           raise Error, "Statement changed; regenerate plan" unless Digest::SHA256.file(source.fetch("path")).hexdigest == source.fetch("sha256")
         end
         state = ledger
-        overrides = MoneyWizImport.validate_overrides(plan["category_overrides"] || {})
-        rules = MoneyWizImport.validate_rules(plan["merchant_rules"] || {})
-        planner_options = { decisions: plan.fetch("decisions"), categories: overrides, rules: rules }
+        decision_file ||= { "decisions" => plan.fetch("decisions"), "category_overrides" => plan["category_overrides"] || {}, "merchant_rules" => plan["merchant_rules"] || {}, "plan" => true }
+        decisions = decision_file.fetch("decisions")
+        overrides = MoneyWizImport.validate_overrides(decision_file.fetch("category_overrides"))
+        rules = MoneyWizImport.validate_rules(decision_file.fetch("merchant_rules"))
+        unknown = (decisions.keys | overrides.keys) - plan.fetch("entries").map { |e| e["id"] }
+        raise Error, "Decisions contain #{unknown.size} unknown transaction IDs; use the matching plan" unless unknown.empty?
+        planner_options = { decisions: decisions, categories: overrides, rules: rules }
+        require_running_app if plan.fetch("entries").any? { |e| e["status"] == "new" } || decisions.any? { |_, d| d["action"] == "new" }
         retained = @snapshotter.call
         Snapshot.prune(File.dirname(retained), keep: @config.fetch("keep_backups", 1))
         reference = Reference.new(retained)
         bank = CLI.load_bank(plan.fetch("sources").map { |s| s.fetch("path") })
         current = Planner.new(bank, reference, @config, ledger: state, **planner_options).build
-        intended = plan.fetch("entries").select { |e| e["status"] == "new" }.to_h { |e| [e["id"], e] }
+        # Rows the reviewer saw as New: an explicit "new" decision, or the automatic
+        # proposal for rows without one. A removed plan decision falls back to the
+        # classification the page shows after Undo.
+        shown = plan.fetch("entries").select do |e|
+          if decision_file["plan"] then e["status"] == "new"
+          elsif decisions.key?(e["id"]) then decisions[e["id"]]["action"] == "new"
+          elsif plan.fetch("decisions").key?(e["id"]) then e["base_status"] == "new"
+          else e["status"] == "new"
+          end
+        end.map { |e| e["id"] }
+        # The payload the reviewer approved: plan rows when applying a plan as is,
+        # otherwise this run's own recheck, since decisions can change categories.
+        baseline = decision_file["plan"] ? plan.fetch("entries") : current
+        intended = baseline.select { |e| shown.include?(e["id"]) && e["status"] == "new" }.to_h { |e| [e["id"], e] }
         # Persist all known matches before the first external side effect.
         current.each do |entry|
           previous = state[entry["id"]]
           next if previous && previous["status"] != "dispatching"
-          if entry["status"] == "existing"
+          if entry["status"] == "existing" && entry["match_gid"]
             matched = reference.transactions.find { |t| t["gid"] == entry.fetch("match_gid") }
             status = previous ? "imported" : "matched"
             state[entry["id"]] = { "status" => status, "gid" => entry.fetch("match_gid"), "bank_cents" => entry["cents"], "matched_cents" => matched.fetch("cents") }
@@ -587,25 +721,40 @@ module MoneyWizImport
         # copy that verified it. Reusing it avoids a second 130 MB copy per entry.
         latest = retained
         current.each do |entry|
-          next unless intended.key?(entry["id"])
+          next unless shown.include?(entry["id"])
           next if %w[existing skip].include?(entry["status"])
           # Reconcile again immediately before each URL against a snapshot taken
           # after every transaction saved earlier in this run.
           fresh = Reference.new(latest)
           entry = Planner.new(bank, fresh, @config, ledger: state, **planner_options).build.find { |e| e["id"] == entry["id"] }
           if entry["status"] == "existing"
-            state[entry["id"]] = { "status" => "matched", "gid" => entry.fetch("match_gid") }
-            save(state)
+            # Reconciled since the plan was written. A row already recorded as
+            # imported keeps that stronger fact, and one without a linked
+            # transaction has nothing new to remember.
+            if entry["match_gid"] && state.dig(entry["id"], "status") != "imported"
+              state[entry["id"]] = { "status" => "matched", "gid" => entry.fetch("match_gid") }
+              save(state)
+            end
             next
           end
-          raise Error, "Transaction now requires review: #{entry['id']}; regenerate plan" unless entry["status"] == "new"
+          raise Error, "Transaction now requires review: #{entry['id']}; regenerate plan" unless entry["status"] == "new" && intended.key?(entry["id"])
           raise Error, "Plan payload changed; regenerate plan" unless MoneyWizImport.url(entry) == MoneyWizImport.url(intended.fetch(entry["id"]))
           # Reserve durably BEFORE opening. Any crash or timeout is unresolved,
           # never a license to retry a potentially successful URL invocation.
           state[entry["id"]] = { "status" => "dispatching", "at" => Time.now.utc.iso8601 }
           save(state)
           @opener.call(MoneyWizImport.url(entry))
-          deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + @config.fetch("verification_seconds", 20)
+          # A record sent without a marker cannot be picked out of the backup, so it
+          # is recorded as imported without a GID rather than searched for. The row
+          # is never proposed again; reconcile the app record by eye.
+          unless MoneyWizImport.memo(entry)
+            state[entry["id"]] = { "status" => "imported" }
+            save(state)
+            count += 1
+            puts "Sent #{count}/#{shown.size}: #{entry['occurred'][0, 10]} #{MoneyWizImport.money(entry['cents'])} #{entry['currency']} (unmarked, not verified)"
+            next
+          end
+          deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + @config.fetch("verification_seconds", 60)
           verified = nil
           loop do
             path = @snapshotter.call
@@ -633,7 +782,7 @@ module MoneyWizImport
           state[entry["id"]] = { "status" => "imported", "gid" => verified.fetch("gid") }
           save(state)
           count += 1
-          puts "Verified #{count}/#{intended.size}: #{entry['occurred'][0, 10]} #{MoneyWizImport.money(entry['cents'])} #{entry['currency']}"
+          puts "Verified #{count}/#{shown.size}: #{entry['occurred'][0, 10]} #{MoneyWizImport.money(entry['cents'])} #{entry['currency']}"
         end
         puts "Imported and verified #{count} transactions."
       ensure
@@ -675,6 +824,25 @@ module MoneyWizImport
       { "decisions" => data, "category_overrides" => overrides, "merchant_rules" => rules }
     end
 
+    # decisions.json beside the plan wins. Browsers open their save dialog in
+    # Documents or Downloads, so a UI export for this exact plan found there is
+    # adopted into the run folder. Anything ambiguous is left to --decisions.
+    def self.locate_decisions(plan, run_dir, search: [File.join(Dir.home, "Documents"), File.join(Dir.home, "Downloads")])
+      beside = File.join(run_dir, "decisions.json")
+      return beside if File.exist?(beside)
+      return nil unless plan["id"]
+      strays = search.flat_map { |dir| Dir.glob(File.join(dir, "*.json")) }.select do |path|
+        File.size(path) < 5_000_000 && JSON.parse(File.read(path))["plan_id"] == plan["id"]
+      rescue JSON::ParserError, Errno::EACCES
+        false
+      end
+      return nil if strays.empty?
+      raise Error, "Several decisions files belong to this plan; pass one with --decisions:\n  #{strays.join("\n  ")}" if strays.size > 1
+      warn "Adopting #{strays.first} into #{run_dir}"
+      FileUtils.mv(strays.first, beside)
+      beside
+    end
+
     def self.sources(paths)
       paths.map { |p| { "path" => File.expand_path(p), "sha256" => Digest::SHA256.file(p).hexdigest } }
     end
@@ -701,26 +869,28 @@ module MoneyWizImport
           import XLSX [...]       Plan in a new private/imports folder and open the review UI; no app writes
           plan XLSX [...]         Generate JSON, CSV and HTML; no app writes
           review [PLAN.json]      Open an existing plan as a static review page; no database access
-          resolve PLAN.json       Recheck sources and saved decisions against a fresh backup; no app writes
-          apply PLAN.json         Create only planned new entries, persist matches/skips, and verify saves
+          apply PLAN.json         Recheck a fresh backup, create reviewed new entries, persist matches/skips, verify saves
+          resolve PLAN.json       Optional preview: the same recheck with saved decisions, written as resolved.*; no app writes
+          release ID              Clear a stuck "dispatching" reservation after confirming MoneyWiz has no such record
           accounts                List account names, currencies, IDs and archive state from a backup
 
+          apply reads decisions.json beside the plan when present; --decisions FILE overrides it.
           resolve requires --decisions FILE. review defaults to private/plan.json.
           import defaults to a new private/imports/<run>/plan.json; plan defaults to private/plan.json.
           resolve defaults to resolved.json beside its input plan. apply requires an explicit plan.
         HELP
         o.on("--config PATH") { |v| options[:config] = v }
         o.on("--snapshot PATH", "import/plan/resolve/accounts: use an existing backup (offline planning)") { |v| options[:snapshot] = v }
-        o.on("--decisions PATH", "import/plan/resolve: load raw or UI-exported decisions JSON") { |v| options[:decisions] = v }
+        o.on("--decisions PATH", "import/plan/resolve/apply: load raw or UI-exported decisions JSON") { |v| options[:decisions] = v }
         o.on("--out PATH", "import/plan/resolve: output plan.json; CSV/HTML use the same stem") { |v| options[:out] = v }
         o.on("--[no-]open", "Open the review page (default for import/review)") { |v| options[:open] = v }
         o.on("-h", "--help") { puts o; return }
       end
       parser.parse!(argv)
       command = argv.shift
-      raise Error, parser.to_s unless %w[import plan review resolve apply accounts].include?(command)
-      if %w[apply review accounts].include?(command) && (options[:decisions] || options[:out])
-        raise Error, "--decisions and --out apply only to import, plan, and resolve; use resolve before apply"
+      raise Error, parser.to_s unless %w[import plan review resolve apply release accounts].include?(command)
+      if %w[apply release review accounts].include?(command) && options[:out] || %w[release review accounts].include?(command) && options[:decisions]
+        raise Error, "--out applies only to import, plan, and resolve; --decisions is not applicable to #{command}"
       end
       if command == "review"
         raise Error, "review accepts at most one plan file" if argv.size > 1
@@ -732,12 +902,28 @@ module MoneyWizImport
         return
       end
       config = JSON.parse(File.read(options[:config]))
+      MoneyWizImport.validate_payees(config.fetch("payees", {}))
       ENV["TZ"] = config.fetch("timezone")
       runner = Runner.new(config)
+      if command == "release"
+        raise Error, "release requires exactly one transaction ID" unless argv.size == 1
+        raise Error, "release always takes a fresh snapshot" if options[:snapshot]
+        runner.release(argv.first)
+        return
+      end
       if command == "apply"
         raise Error, "apply requires exactly one plan file" unless argv.size == 1
         raise Error, "apply always takes fresh snapshots" if options[:snapshot]
-        runner.apply(JSON.parse(File.read(argv.first)))
+        plan_path = File.expand_path(argv.first)
+        plan = JSON.parse(File.read(plan_path))
+        # The review page saves decisions.json beside plan.json; --decisions overrides.
+        decisions_path = options[:decisions] || locate_decisions(plan, File.dirname(plan_path))
+        decision_file = nil
+        if decisions_path
+          decision_file = read_decision_file(decisions_path, plan.fetch("sources"))
+          puts "Decisions: #{File.expand_path(decisions_path)} (#{decision_file.fetch('decisions').size} decisions)"
+        end
+        runner.apply(plan, decision_file)
         return
       end
       raise Error, "accounts takes no files" if command == "accounts" && !argv.empty?
