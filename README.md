@@ -299,8 +299,9 @@ moneywiz_import release 'bog-v1-…'
 Release rechecks a fresh backup for the marker and refuses when a record exists.
 Never edit the ledger by hand and never resend a URL manually.
 
-Transactions created by the importer, and MoneyWiz entries already matched or
-imported in the ledger, are never duplicate candidates for other bank rows. A
+Transactions created by the importer, MoneyWiz entries already matched or
+imported in the ledger, and entries exact-matched to another bank row in the same
+plan are never duplicate candidates for other bank rows. A
 memo marker alone is not treated as proof of authorship: MoneyWiz copies the memo
 when you duplicate a record or turn one into a transfer, so an entry whose marker
 does not fit its own account and amount stays available to the bank row it really

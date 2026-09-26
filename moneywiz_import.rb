@@ -422,6 +422,9 @@ module MoneyWizImport
         titles = pairs.map { |_, t| MoneyWizImport.normalize(t["description"]) }.uniq
         @aliases[merchant] = { "samples" => pairs.size, "category" => categories.size == 1 ? categories.first : nil, "titles" => titles }
       end
+      # Records matched in this run are not yet in the ledger, but they are spoken
+      # for all the same: a near amount must not point at them as a duplicate.
+      taken = selected.values.to_h { |t| [t["gid"], true] }
       entries = @bank.map do |b|
         category, category_source = resolve_category(b)
         raise Error, "Unknown category #{category} for #{b['id']}" if category && !@reference.category_paths.value?(category)
@@ -454,10 +457,10 @@ module MoneyWizImport
         elsif selected[b["id"]]
           entry.merge("status" => "existing", "reason" => "reciprocal exact amount/account and closest date", "match_gid" => selected[b["id"]]["gid"])
         else
-          classify_unmatched(entry)
+          classify_unmatched(entry, taken)
         end
       end
-      flag_aggregates(entries)
+      flag_aggregates(entries, taken)
       entries.each { |entry| entry["base_status"] = entry["status"] }
       apply_decisions(entries)
       duplicates = entries.select { |e| e["match_gid"] }.group_by { |e| e["match_gid"] }.select { |_, es| es.size > 1 }
@@ -472,7 +475,7 @@ module MoneyWizImport
       entries
     end
 
-    def flag_aggregates(entries)
+    def flag_aggregates(entries, taken = {})
       # A manual entry can combine several bank charges (e.g. purchase + FX fee,
       # or several ATM withdrawals). Surface these BEFORE calling anything new.
       groups = entries.group_by do |e|
@@ -486,7 +489,7 @@ module MoneyWizImport
           unmatched.combination(count) do |parts|
             next unless parts.map { |e| e["cents"] <=> 0 }.uniq.size == 1
             total = parts.sum { |e| e["cents"] }
-            candidates = pool.select { |t| same_account?(parts.first, t) && t["cents"] == total && distance(parts.first, t) <= 1 }
+            candidates = pool.select { |t| !taken[t["gid"]] && same_account?(parts.first, t) && t["cents"] == total && distance(parts.first, t) <= 1 }
             next if candidates.empty?
             parts.each do |part|
               part.merge!("status" => "review", "reason" => "possible combined manual entry (bank rows #{parts.map { |p| p['row'] }.join(', ')} total #{MoneyWizImport.money(total)})")
@@ -497,7 +500,7 @@ module MoneyWizImport
       end
       # Conversely, one bank purchase may have been entered as several app rows.
       entries.select { |e| e["status"] == "new" }.each do |entry|
-        nearby = pool.select { |t| same_account?(entry, t) && distance(entry, t) <= 1 && (t["cents"] <=> 0) == (entry["cents"] <=> 0) && t["cents"].abs < entry["cents"].abs }
+        nearby = pool.select { |t| !taken[t["gid"]] && same_account?(entry, t) && distance(entry, t) <= 1 && (t["cents"] <=> 0) == (entry["cents"] <=> 0) && t["cents"].abs < entry["cents"].abs }
         next if nearby.size > 20
         (2..[nearby.size, 4].min).each do |count|
           split = nearby.combination(count).find { |parts| parts.sum { |t| t["cents"] } == entry["cents"] }
@@ -517,8 +520,9 @@ module MoneyWizImport
       end
     end
 
-    def classify_unmatched(entry)
+    def classify_unmatched(entry, taken = {})
       nearby = pool.select do |t|
+        next false if taken[t["gid"]]
         next false unless same_account?(entry, t) && distance(entry, t) <= @config.fetch("review_days", 10)
         next false unless (entry["cents"] <=> 0) == (t["cents"] <=> 0)
         delta = (entry["cents"] - t["cents"]).abs

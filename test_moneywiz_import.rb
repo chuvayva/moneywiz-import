@@ -275,6 +275,11 @@ class MoneyWizImportTest < Minitest::Test
     assert_equal "new", entries.first["status"]
     # An unclaimed transaction still flags a possible duplicate.
     assert_equal "review", plan([bank(id: "bank2", amount: -1050)], [transaction(id: "t1")]).first["status"]
+    # A transaction exact-matched to another bank row in this same run is spoken for
+    # too, even though the ledger learns about it only after apply.
+    entries = plan([bank(id: "bank1"), bank(id: "bank2", amount: -1050, merchant: "Other, Tbilisi")], [transaction(id: "t1")])
+    assert_equal %w[existing new], entries.map { |e| e["status"] }
+    assert_empty entries.last["candidates"]
   end
 
   def test_category_learning_requires_repeated_consistent_examples
