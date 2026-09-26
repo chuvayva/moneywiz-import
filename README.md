@@ -371,8 +371,10 @@ beside links for the two test scripts; if you move the project, update those lin
 - Account, currency, signed amount, and purchase/posting dates drive matching.
   Reciprocal closest exact-amount matches within five days can match completely
   different titles; this is a heuristic, not proof of identity. Ties remain review.
-- Near amounts, dates up to ten days apart, competing matches, and possible
-  combined/split entries are flagged instead of automatically imported.
+- Competing matches, possible combined/split entries, and entries up to ten days
+  apart whose title names the merchant are flagged instead of automatically
+  imported. A nearby entry with a merely similar amount is not a candidate: card
+  statements carry exact amounts, so such an entry is a different purchase.
 - Category precedence: your explicit per-row choice, then an "always" merchant
   rule from the ledger or the decisions file, then a category learned from at
   least three unambiguous exact matches of the merchant that all agree. Otherwise

@@ -520,16 +520,16 @@ module MoneyWizImport
       end
     end
 
+    # Card statements carry exact amounts, so a nearby entry with a slightly
+    # different amount is another purchase, not this one. Only an entry whose
+    # title names the merchant is worth a look when the amount differs.
     def classify_unmatched(entry, taken = {})
+      merchant = MoneyWizImport.normalize(entry["payee"])
       nearby = pool.select do |t|
-        next false if taken[t["gid"]]
+        next false if taken[t["gid"]] || merchant.empty?
         next false unless same_account?(entry, t) && distance(entry, t) <= @config.fetch("review_days", 10)
         next false unless (entry["cents"] <=> 0) == (t["cents"] <=> 0)
-        delta = (entry["cents"] - t["cents"]).abs
-        tolerance = [100, (entry["cents"].abs * 0.03).round].max
-        title = MoneyWizImport.normalize(t["description"] + " " + t["payee"])
-        merchant = MoneyWizImport.normalize(entry["payee"])
-        delta <= tolerance || (!merchant.empty? && title.include?(merchant))
+        MoneyWizImport.normalize(t["description"] + " " + t["payee"]).include?(merchant)
       end
       entry["candidates"] = (entry["candidates"] + nearby).uniq { |t| t["gid"] }
       if !entry["candidates"].empty?

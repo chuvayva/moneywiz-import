@@ -135,8 +135,10 @@ class MoneyWizImportTest < Minitest::Test
     assert entries.all? { |e| e["status"] == "review" }
   end
 
-  def test_small_amount_change_is_not_imported
-    assert_equal "review", plan([bank(amount: -1749)], [transaction(amount: -1775)]).first["status"]
+  def test_near_amount_alone_is_new_but_a_matching_title_still_needs_review
+    assert_equal "new", plan([bank(amount: -1560)], [transaction(amount: -1620, description: "Taxi")]).first["status"]
+    assert_equal "review", plan([bank(amount: -1560)], [transaction(amount: -1620, description: "Shop lunch")]).first["status"]
+    assert_equal "review", plan([bank(amount: -1560)], [transaction(amount: -1620, payee: "SHOP")]).first["status"]
   end
 
   def test_aggregated_bank_rows_are_not_new
@@ -273,11 +275,11 @@ class MoneyWizImportTest < Minitest::Test
     # Near amount and merchant title of a claimed row do not trigger review either.
     entries = plan([bank(id: "bank2", amount: -1050, merchant: "Shop, Tbilisi")], [transaction(id: "t1", description: "Shop")], ledger: { "other" => { "status" => "imported", "gid" => "t1" } })
     assert_equal "new", entries.first["status"]
-    # An unclaimed transaction still flags a possible duplicate.
-    assert_equal "review", plan([bank(id: "bank2", amount: -1050)], [transaction(id: "t1")]).first["status"]
+    # An unclaimed transaction titled with the merchant still flags a possible duplicate.
+    assert_equal "review", plan([bank(id: "bank2", amount: -1050)], [transaction(id: "t1", description: "Shop")]).first["status"]
     # A transaction exact-matched to another bank row in this same run is spoken for
     # too, even though the ledger learns about it only after apply.
-    entries = plan([bank(id: "bank1"), bank(id: "bank2", amount: -1050, merchant: "Other, Tbilisi")], [transaction(id: "t1")])
+    entries = plan([bank(id: "bank1"), bank(id: "bank2", amount: -1050)], [transaction(id: "t1", description: "Shop")])
     assert_equal %w[existing new], entries.map { |e| e["status"] }
     assert_empty entries.last["candidates"]
   end
