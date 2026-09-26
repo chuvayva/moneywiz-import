@@ -94,7 +94,14 @@ module MoneyWizImport
     def self.take(source, directory: File.join(PRIVATE, "backups"))
       FileUtils.mkdir_p(directory, mode: 0o700)
       path = File.join(directory, "#{Time.now.utc.strftime('%Y%m%dT%H%M%S')}-#{SecureRandom.hex(5)}.sqlite")
-      input = SQLite3::Database.new(File.expand_path(source), readonly: true)
+      begin
+        input = SQLite3::Database.new(File.expand_path(source), readonly: true)
+      rescue SQLite3::CantOpenException
+        # MoneyWiz keeps its store inside its app container; macOS lets a process
+        # stat the file but not open it until the terminal has Full Disk Access.
+        raise Error, "Cannot open the MoneyWiz database #{source}. Check the path in config.json, or grant this terminal app " \
+                     "Full Disk Access (System Settings > Privacy & Security > Full Disk Access) and restart it."
+      end
       output = SQLite3::Database.new(path)
       backup = SQLite3::Backup.new(output, "main", input, "main")
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15
@@ -824,10 +831,14 @@ module MoneyWizImport
       { "decisions" => data, "category_overrides" => overrides, "merchant_rules" => rules }
     end
 
+    HOME_SEARCH = [File.join(Dir.home, "Documents"), File.join(Dir.home, "Downloads")].freeze
+    DOWNLOADS = File.join(Dir.home, "Downloads")
+    REPORT_NAME = /\AReport-(\d{4}-\d{2}-\d{2})(?: \(\d+\))?\.xlsx\z/
+
     # decisions.json beside the plan wins. Browsers open their save dialog in
     # Documents or Downloads, so a UI export for this exact plan found there is
-    # adopted into the run folder. Anything ambiguous is left to --decisions.
-    def self.locate_decisions(plan, run_dir, search: [File.join(Dir.home, "Documents"), File.join(Dir.home, "Downloads")])
+    # reported as well. Anything ambiguous is left to --decisions.
+    def self.find_decisions(plan, run_dir, search: HOME_SEARCH)
       beside = File.join(run_dir, "decisions.json")
       return beside if File.exist?(beside)
       return nil unless plan["id"]
@@ -838,9 +849,79 @@ module MoneyWizImport
       end
       return nil if strays.empty?
       raise Error, "Several decisions files belong to this plan; pass one with --decisions:\n  #{strays.join("\n  ")}" if strays.size > 1
-      warn "Adopting #{strays.first} into #{run_dir}"
-      FileUtils.mv(strays.first, beside)
+      strays.first
+    end
+
+    # Same lookup, but a stray export is adopted into the run folder first.
+    def self.locate_decisions(plan, run_dir, search: HOME_SEARCH)
+      found = find_decisions(plan, run_dir, search: search)
+      beside = File.join(run_dir, "decisions.json")
+      return found if found.nil? || found == beside
+      warn "Adopting #{found} into #{run_dir}"
+      FileUtils.mv(found, beside)
       beside
+    end
+
+    # The bank names its exports Report-YYYY-MM-DD.xlsx; a browser may add " (1)"
+    # to a repeated download. The newest statement date wins, then the newest file.
+    def self.latest_report(directory = DOWNLOADS)
+      Dir.children(directory).select { |name| name.match?(REPORT_NAME) }.map { |name| File.join(directory, name) }
+         .max_by { |path| [File.basename(path)[REPORT_NAME, 1], File.mtime(path)] }
+    rescue Errno::ENOENT
+      nil
+    end
+
+    # Plans built from exactly this statement, newest first.
+    def self.plans_for(sha256, imports: File.join(PRIVATE, "imports"))
+      Dir.glob(File.join(imports, "*", "plan.json")).filter_map do |path|
+        plan = JSON.parse(File.read(path))
+        next unless plan["sources"]&.map { |s| s["sha256"] }&.uniq == [sha256]
+        [path, plan]
+      rescue JSON::ParserError
+        nil
+      end.sort_by { |_, plan| plan["created_at"].to_s }.reverse
+    end
+
+    def self.confirm(question)
+      $stdout.print "#{question} [y/N] "
+      $stdout.flush
+      answer = $stdin.gets
+      puts if answer.nil?
+      %w[y yes].include?(answer.to_s.strip.downcase)
+    end
+
+    # No arguments: find the newest bank export in Downloads and, depending on
+    # what already exists for it, offer to import it or to apply its reviewed
+    # decisions. Returns the command and files to run, or nil when declined.
+    def self.auto(downloads: DOWNLOADS, imports: File.join(PRIVATE, "imports"), search: HOME_SEARCH)
+      report = latest_report(downloads)
+      raise Error, "No Report-YYYY-MM-DD.xlsx found in #{downloads}; pass a statement path to import" unless report
+      puts "Statement: #{report} (modified #{File.mtime(report).strftime('%Y-%m-%d %H:%M')})"
+      plans = plans_for(Digest::SHA256.file(report).hexdigest, imports: imports)
+      reviewed = plans.filter_map do |path, plan|
+        decisions = find_decisions(plan, File.dirname(path), search: search)
+        [path, plan, decisions] if decisions
+      end.first
+      if reviewed
+        path, plan, decisions = reviewed
+        count = read_decision_file(decisions, plan.fetch("sources")).fetch("decisions").size
+        summary = plan.fetch("summary", {})
+        puts "Plan: #{path} (created #{plan['created_at']}; #{summary.fetch('new', 0)} new, #{summary.fetch('review', 0)} need review)"
+        puts "Decisions: #{decisions} (#{count} decisions)"
+        return ["apply", [path]] if confirm("Apply this plan: create its New entries in MoneyWiz?")
+        return nil
+      end
+      if plans.any?
+        path, plan = plans.first
+        puts "Plan: #{path} (created #{plan['created_at']})"
+        puts "No decisions file for this plan beside it, in Documents, or in Downloads."
+        return ["review", [path]] if confirm("Reopen its review page?")
+        return ["import", [report]] if confirm("Start a fresh import of the statement instead?")
+        return nil
+      end
+      puts "No plan exists for this statement yet."
+      return ["import", [report]] if confirm("Import it and open the review page?")
+      nil
     end
 
     def self.sources(paths)
@@ -864,8 +945,10 @@ module MoneyWizImport
       options = { config: File.join(ROOT, "config.json") }
       parser = OptionParser.new do |o|
         o.banner = <<~HELP
-          Usage: moneywiz_import.rb COMMAND [files] [options]
+          Usage: moneywiz_import [COMMAND] [files] [options]
 
+          (no command)            Find the newest Report-YYYY-MM-DD.xlsx in ~/Downloads, then ask before
+                                  importing it, or before applying it once its decisions file was saved
           import XLSX [...]       Plan in a new private/imports folder and open the review UI; no app writes
           plan XLSX [...]         Generate JSON, CSV and HTML; no app writes
           review [PLAN.json]      Open an existing plan as a static review page; no database access
@@ -888,6 +971,12 @@ module MoneyWizImport
       end
       parser.parse!(argv)
       command = argv.shift
+      if command.nil? || command == "auto"
+        raise Error, "The automatic flow takes no files; pass a command to use #{argv.first}" unless argv.empty?
+        raise Error, "The automatic flow takes no --out, --decisions, or --snapshot" if options[:out] || options[:decisions] || options[:snapshot]
+        command, argv = auto
+        return unless command
+      end
       raise Error, parser.to_s unless %w[import plan review resolve apply release accounts].include?(command)
       if %w[apply release review accounts].include?(command) && options[:out] || %w[release review accounts].include?(command) && options[:decisions]
         raise Error, "--out applies only to import, plan, and resolve; --decisions is not applicable to #{command}"

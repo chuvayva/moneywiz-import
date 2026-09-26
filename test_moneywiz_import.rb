@@ -3,6 +3,7 @@
 
 require_relative "moneywiz_import"
 require "minitest/autorun"
+require "stringio"
 require "minitest/mock"
 require "tmpdir"
 
@@ -337,6 +338,64 @@ class MoneyWizImportTest < Minitest::Test
       File.write(File.join(docs, "b.json"), JSON.generate("plan_id" => "abc"))
       FileUtils.rm(File.join(run, "decisions.json"))
       assert_raises(M::Error) { M::CLI.locate_decisions(plan, run, search: [docs]) }
+    end
+  end
+
+  def test_latest_report_prefers_newest_statement_date_then_newest_file
+    Dir.mktmpdir do |dir|
+      assert_nil M::CLI.latest_report(dir)
+      assert_nil M::CLI.latest_report(File.join(dir, "missing"))
+      %w[Report-2026-09-06.xlsx other.xlsx Report-2026-09-26.xlsx notes.txt].each { |name| File.write(File.join(dir, name), name) }
+      assert_equal File.join(dir, "Report-2026-09-26.xlsx"), M::CLI.latest_report(dir)
+      repeat = File.join(dir, "Report-2026-09-26 (1).xlsx")
+      File.write(repeat, "again")
+      File.utime(Time.now + 60, Time.now + 60, repeat)
+      assert_equal repeat, M::CLI.latest_report(dir), "a repeated download of the same day is newer"
+    end
+  end
+
+  def test_auto_offers_import_then_apply_once_a_decisions_file_exists
+    Dir.mktmpdir do |dir|
+      downloads, docs, imports = File.join(dir, "Downloads"), File.join(dir, "Documents"), File.join(dir, "imports")
+      [downloads, docs, imports].each { |d| FileUtils.mkdir_p(d) }
+      auto = ->(answers) { $stdin = StringIO.new(answers); capture_io { @result = M::CLI.auto(downloads: downloads, imports: imports, search: [docs]) }.first }
+      assert_raises(M::Error) { auto.call("y\n") }
+      report = File.join(downloads, "Report-2026-09-26.xlsx")
+      File.write(report, "statement")
+      out = auto.call("n\n")
+      assert_nil @result
+      assert_includes out, "No plan exists"
+      auto.call("yes\n")
+      assert_equal ["import", [report]], @result
+      auto.call("")
+      assert_nil @result, "EOF counts as no"
+
+      sha = Digest::SHA256.file(report).hexdigest
+      run = File.join(imports, "20260926T100000-abc123")
+      FileUtils.mkdir_p(run)
+      plan = { "id" => "abc123", "created_at" => "2026-09-26T10:00:00Z", "sources" => [{ "path" => report, "sha256" => sha }], "summary" => { "new" => 2, "review" => 3 } }
+      File.write(File.join(run, "plan.json"), JSON.generate(plan))
+      other = File.join(imports, "20260901T000000-000000")
+      FileUtils.mkdir_p(other)
+      File.write(File.join(other, "plan.json"), JSON.generate(plan.merge("id" => "old", "sources" => [{ "path" => "x", "sha256" => "0" * 64 }])))
+      out = auto.call("y\n")
+      assert_equal ["review", [File.join(run, "plan.json")]], @result
+      assert_includes out, "No decisions file"
+      auto.call("n\ny\n")
+      assert_equal ["import", [report]], @result
+      auto.call("n\nn\n")
+      assert_nil @result
+
+      File.write(File.join(docs, "moneywiz-decisions-abc123.json"), JSON.generate("type" => "moneywiz-decisions", "version" => 1, "plan_id" => "abc123", "source_hashes" => [sha], "decisions" => { "b1" => { "action" => "skip" } }))
+      out = auto.call("y\n")
+      assert_equal ["apply", [File.join(run, "plan.json")]], @result
+      assert_includes out, "1 decisions"
+      assert_includes out, "2 new, 3 need review"
+      assert File.exist?(File.join(docs, "moneywiz-decisions-abc123.json")), "asking does not move the export"
+      auto.call("n\n")
+      assert_nil @result
+    ensure
+      $stdin = STDIN
     end
   end
 

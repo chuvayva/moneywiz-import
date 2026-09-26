@@ -123,9 +123,9 @@ class ReviewTest < Minitest::Test
     @browser.execute("plan.config_path='/elsewhere/other.json'; commands()")
     assert_includes evaluate("document.getElementById('import-command').textContent"), "--config '/elsewhere/other.json'"
     @browser.execute("delete plan.config_path; commands()")
-    assert_equal "moneywiz_import.rb apply '#{@path}'", evaluate("document.getElementById('apply-command').textContent")
+    assert_equal "moneywiz_import apply '#{@path}'", evaluate("document.getElementById('apply-command').textContent")
     @browser.execute("const p=document.getElementById('decision-path'); p.value='/Users/me/Downloads/decisions.json'; p.dispatchEvent(new Event('input'))")
-    assert_equal "moneywiz_import.rb apply '#{@path}' --decisions '/Users/me/Downloads/decisions.json'", evaluate("document.getElementById('apply-command').textContent")
+    assert_equal "moneywiz_import apply '#{@path}' --decisions '/Users/me/Downloads/decisions.json'", evaluate("document.getElementById('apply-command').textContent")
     assert_includes evaluate("document.getElementById('resolve-command').textContent"), "--decisions '/Users/me/Downloads/decisions.json'"
   end
 

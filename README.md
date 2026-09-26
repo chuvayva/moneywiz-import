@@ -1,9 +1,21 @@
 # MoneyWiz importer and offline review app
 
-Download a Bank of Georgia XLSX whenever you need it, then run:
+Download a Bank of Georgia XLSX whenever you need it, then run the command with
+no arguments:
 
 ```sh
-moneywiz_import.rb import '/path/to/new-statement.xlsx'
+moneywiz_import
+```
+
+It finds the newest `Report-YYYY-MM-DD.xlsx` in `~/Downloads` and asks whether to
+import it. Answer yes, review the page, click **Save decisions** and save the file
+in Documents or Downloads, then run the same bare command again: it finds the plan
+for that statement and its decisions file, and asks whether to apply. Nothing is
+created in MoneyWiz until you answer yes to that second question. The explicit
+commands below do the same steps with paths you choose:
+
+```sh
+moneywiz_import import '/path/to/new-statement.xlsx'
 ```
 
 The command compares the statement with a fresh MoneyWiz database backup and the
@@ -18,10 +30,32 @@ The launcher handles this Mac's asdf fallback to old system Ruby outside the pro
 
 ## Main workflow: each new bank export
 
+### 0. Or let the bare command pick the files
+
+```sh
+moneywiz_import
+```
+
+With no command, the script looks for the newest `Report-YYYY-MM-DD.xlsx` in
+`~/Downloads` (a browser's `Report-2026-09-26 (1).xlsx` counts as the same day and
+wins when it is newer) and prints what it found. Then it decides by what already
+exists for that exact file, and always asks before doing anything:
+
+| Situation | Question | Answer yes and it runs |
+| --- | --- | --- |
+| No plan was built from this statement | Import it and open the review page? | `import` on that file |
+| A plan exists and a decisions file for it sits beside it, in Documents, or in Downloads | Apply this plan: create its New entries in MoneyWiz? | `apply` on that plan |
+| A plan exists but no decisions file was found | Reopen its review page? Then: start a fresh import instead? | `review`, or `import` |
+
+Answering anything but `y`/`yes` exits without changes. The flow takes no files or
+`--out`/`--decisions`/`--snapshot`; use the named commands for those. Running it a
+third time after a successful apply offers to apply again, which is safe: rows
+created earlier are recognized by their markers and skipped.
+
 ### 1. Prepare a new import
 
 ```sh
-moneywiz_import.rb import '/path/to/new-statement.xlsx'
+moneywiz_import import '/path/to/new-statement.xlsx'
 ```
 
 Use an absolute path, or a path relative to your current terminal directory.
@@ -119,7 +153,7 @@ adds `--decisions` to the generated command, or pass the flag yourself.
 ### 4. Apply
 
 ```sh
-moneywiz_import.rb apply '/path/to/run/plan.json'
+moneywiz_import apply '/path/to/run/plan.json'
 ```
 
 This is the command that **creates real MoneyWiz transactions**. MoneyWiz must
@@ -154,7 +188,7 @@ previous decisions rather than merging with them.
 ### 5. Optional: preview before applying
 
 ```sh
-moneywiz_import.rb resolve '/path/to/run/plan.json' --decisions '/path/to/run/decisions.json' --open
+moneywiz_import resolve '/path/to/run/plan.json' --decisions '/path/to/run/decisions.json' --open
 ```
 
 This runs the same recheck as `apply` without creating anything and writes
@@ -165,7 +199,7 @@ long pause between review and apply. You can then apply `plan.json` as above.
 ### 6. Next time
 
 ```sh
-moneywiz_import.rb import '/path/to/next-statement.xlsx'
+moneywiz_import import '/path/to/next-statement.xlsx'
 ```
 
 Keep **private/ledger.json**. The new import recognizes saved transaction markers,
@@ -178,14 +212,15 @@ bound to their source-file hashes and will be rejected for different inputs.
 
 | Command | What it does | App changes? |
 | --- | --- | --- |
-| `moneywiz_import.rb import FILE.xlsx [MORE.xlsx …]` | Fresh comparison; saves a separate run under `private/imports/` and opens its HTML page. | No |
-| `moneywiz_import.rb plan FILE.xlsx [MORE.xlsx …]` | Same comparison; writes `private/plan.json`, `.csv`, `.html` by default without opening a browser. | No |
-| `moneywiz_import.rb review [PLAN.json]` | Regenerates and opens HTML from a saved plan. No database access. Defaults to `private/plan.json`. | No |
-| `moneywiz_import.rb apply PLAN.json [--decisions FILE.json]` | Rechecks a fresh backup with your decisions, creates the reviewed New entries via MoneyWiz URLs, verifies each save, and persists matches/skips. Reads `decisions.json` beside the plan by default. Requires an explicit plan path. | **Yes** |
-| `moneywiz_import.rb resolve PLAN.json --decisions FILE.json` | Optional preview of the same recheck; writes `resolved.*` beside the input without creating anything. | No |
-| `moneywiz_import.rb release ID` | Clears a stuck `dispatching` reservation after confirming, through a fresh backup, that MoneyWiz holds no record marked with that ID. | Ledger only |
-| `moneywiz_import.rb accounts` | Lists account names, currencies, stable IDs, and archive state using a fresh backup. | No |
-| `moneywiz_import.rb --help` | Shows commands, defaults, and flags. `-h` is equivalent. | No |
+| `moneywiz_import` | Finds the newest `Report-YYYY-MM-DD.xlsx` in `~/Downloads`; asks before importing it, or before applying its plan once a decisions file for that plan exists. | Only after you confirm apply |
+| `moneywiz_import import FILE.xlsx [MORE.xlsx …]` | Fresh comparison; saves a separate run under `private/imports/` and opens its HTML page. | No |
+| `moneywiz_import plan FILE.xlsx [MORE.xlsx …]` | Same comparison; writes `private/plan.json`, `.csv`, `.html` by default without opening a browser. | No |
+| `moneywiz_import review [PLAN.json]` | Regenerates and opens HTML from a saved plan. No database access. Defaults to `private/plan.json`. | No |
+| `moneywiz_import apply PLAN.json [--decisions FILE.json]` | Rechecks a fresh backup with your decisions, creates the reviewed New entries via MoneyWiz URLs, verifies each save, and persists matches/skips. Reads `decisions.json` beside the plan by default. Requires an explicit plan path. | **Yes** |
+| `moneywiz_import resolve PLAN.json --decisions FILE.json` | Optional preview of the same recheck; writes `resolved.*` beside the input without creating anything. | No |
+| `moneywiz_import release ID` | Clears a stuck `dispatching` reservation after confirming, through a fresh backup, that MoneyWiz holds no record marked with that ID. | Ledger only |
+| `moneywiz_import accounts` | Lists account names, currencies, stable IDs, and archive state using a fresh backup. | No |
+| `moneywiz_import --help` | Shows commands, defaults, and flags. `-h` is equivalent. | No |
 | `test_moneywiz_import.rb` | Runs importer tests using temporary databases and simulated URL delivery. | No |
 | `test_review.rb` | Runs the static UI tests in headless Chrome, using temporary synthetic plans. | No |
 
@@ -212,7 +247,7 @@ project directory. The browser generates absolute commands for each embedded pla
 Reopen the same HTML file, or run:
 
 ```sh
-moneywiz_import.rb review '/path/to/run/plan.json'
+moneywiz_import review '/path/to/run/plan.json'
 ```
 
 Its browser draft is restored for that exact plan when localStorage is available.
@@ -227,13 +262,13 @@ terminal commands reference the right file.
 ### Review only, with a chosen output
 
 ```sh
-moneywiz_import.rb plan '/path/to/statement.xlsx' --out '/path/to/run/plan.json' --open
+moneywiz_import plan '/path/to/statement.xlsx' --out '/path/to/run/plan.json' --open
 ```
 
 ### Multiple overlapping exports
 
 ```sh
-moneywiz_import.rb import '/path/to/first.xlsx' '/path/to/wider.xlsx'
+moneywiz_import import '/path/to/first.xlsx' '/path/to/wider.xlsx'
 ```
 
 Overlapping identities use maximum multiplicity across files, not a sum. Truly
@@ -258,7 +293,7 @@ app shows no such record, for example because the app was not running when the U
 was sent, clear the reservation with the ID from the error message:
 
 ```sh
-moneywiz_import.rb release 'bog-v1-…'
+moneywiz_import release 'bog-v1-…'
 ```
 
 Release rechecks a fresh backup for the marker and refuses when a record exists.
@@ -291,7 +326,7 @@ already represented by several app entries after confirming the split.
 ### Check or change accounts
 
 ```sh
-moneywiz_import.rb accounts
+moneywiz_import accounts
 ```
 
 Use the exact active account names and matching currencies in `config.json`.
@@ -314,8 +349,8 @@ Use `--config '/path/to/config.json'` consistently for an alternative configurat
 ### Work from a retained backup
 
 ```sh
-moneywiz_import.rb plan '/path/to/statement.xlsx' --snapshot '/path/to/backup.sqlite' --open
-moneywiz_import.rb accounts --snapshot '/path/to/backup.sqlite'
+moneywiz_import plan '/path/to/statement.xlsx' --snapshot '/path/to/backup.sqlite' --open
+moneywiz_import accounts --snapshot '/path/to/backup.sqlite'
 ```
 
 These commands do not need to read the live MoneyWiz store. Applying always
@@ -326,8 +361,8 @@ rechecks the live state through new backups.
 Requires macOS, MoneyWiz, Ruby 3.3+, and Bundler. Tested here on Ruby 3.4.7.
 From this folder, install dependencies once with `bundle install`, then use
 `./moneywiz_import.rb`. To use a bare name elsewhere, place a symlink to this
-script in a directory on PATH. The existing links on this Mac point into this
-project; if you move it, update those links. UI tests require Google Chrome;
+script in a directory on PATH. On this Mac that link is `~/.local/bin/moneywiz_import`,
+beside links for the two test scripts; if you move the project, update those links. UI tests require Google Chrome;
 `CHROME_PATH` can select another Chrome/Chromium executable.
 
 ## How matching and duplicate prevention work
