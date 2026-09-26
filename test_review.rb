@@ -196,6 +196,9 @@ class ReviewTest < Minitest::Test
     assert_equal({ "category" => "Groceries", "always" => true }, evaluate("rules['nikora']"))
     assert_equal({ "category" => "Groceries", "source" => "rule" }, evaluate("categoryOf(plan.entries[1])"), "same merchant, different spacing/case")
     assert_includes @browser.at_css('tr[data-id="review-1"]').text, "Groceries · merchant rule"
+    assert_nil @browser.at_css('tr[data-id="review-1"] .nocat'), "a categorized row carries no mark"
+    assert_equal "Uncategorized", @browser.at_css('tr[data-id="locked-1"] .nocat')&.text, "an importable row without a category is marked"
+    assert_nil @browser.at_css('tr[data-id="existing-1"] .nocat'), "matched rows are not imported, so no mark"
     # Answer "no" for a different category.
     set_select("entry-category", "Cafe")
     assert_equal true, evaluate("document.getElementById('rule-dialog').open")
