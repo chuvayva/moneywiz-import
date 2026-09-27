@@ -44,13 +44,17 @@ exists for that exact file, and always asks before doing anything:
 | Situation | Question | Answer yes and it runs |
 | --- | --- | --- |
 | No plan was built from this statement | Import it and open the review page? | `import` on that file |
-| A plan exists and a decisions file for it sits beside it, in Documents, or in Downloads | Apply this plan: create its New entries in MoneyWiz? | `apply` on that plan |
+| A plan exists and a decisions file for it sits in Documents or Downloads | Apply this plan: create its New entries in MoneyWiz? | `apply` on that plan |
+| A plan exists and its decisions file was already applied (it now sits beside the plan) | Start a fresh import of the statement? | `import` |
 | A plan exists but no decisions file was found | Reopen its review page? Then: start a fresh import instead? | `review`, or `import` |
 
 Answering anything but `y`/`yes` exits without changes. The flow takes no files or
-`--out`/`--decisions`/`--snapshot`; use the named commands for those. Running it a
-third time after a successful apply offers to apply again, which is safe: rows
-created earlier are recognized by their markers and skipped.
+`--out`/`--decisions`/`--snapshot`; use the named commands for those. Only a file
+saved from the review page into Documents or Downloads counts as "ready to apply":
+apply moves that file beside the plan, so a copy already there means the plan was
+applied. To apply the same plan again after changing decisions, save a new file
+from the page; the newest file wins and replaces the earlier copy. An apply that
+stopped early can also be repeated with the explicit `apply` command.
 
 ### 1. Prepare a new import
 
@@ -145,7 +149,8 @@ is temporary recovery storage, not your durable import ledger.
 A page opened from disk cannot write to its own folder or see where a file went,
 so the picker has to be pointed at the run folder by hand. If the file ends up in
 Documents or Downloads instead, `apply` still finds it: a JSON file there that
-belongs to this exact plan is moved into the run folder and used. Safari and
+belongs to this exact plan is moved into the run folder and used. When both a
+file beside the plan and one in those folders exist, the newest wins. Safari and
 Firefox have no picker and download the file, which the same lookup covers. For
 any other location, set the path in the **Workflow & commands** tab, which then
 adds `--decisions` to the generated command, or pass the flag yourself.

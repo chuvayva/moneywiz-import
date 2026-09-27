@@ -341,6 +341,17 @@ class MoneyWizImportTest < Minitest::Test
       assert_includes found.last, "Adopting"
       refute File.exist?(File.join(docs, "decisions.json")), "the stray file is moved, not copied"
       assert_equal File.join(run, "decisions.json"), M::CLI.locate_decisions(plan, run, search: [docs])
+      # A newer export beside an adopted copy is the reviewer's latest word and replaces it.
+      later = File.join(docs, "again.json")
+      File.write(later, JSON.generate("plan_id" => "abc", "decisions" => { "b1" => { "action" => "skip" } }))
+      File.utime(Time.now + 60, Time.now + 60, later)
+      assert_equal later, M::CLI.find_decisions(plan, run, search: [docs])
+      assert_equal later, M::CLI.find_decisions(plan, run, search: [docs], beside: false), "beside: false still sees the stray"
+      found = capture_io { @found = M::CLI.locate_decisions(plan, run, search: [docs]) }
+      assert_includes found.last, "replacing"
+      assert_equal File.join(run, "decisions.json"), @found
+      assert_includes File.read(@found), "skip"
+      assert_nil M::CLI.find_decisions(plan, run, search: [docs], beside: false), "an adopted copy is not a Documents file"
       File.write(File.join(docs, "a.json"), JSON.generate("plan_id" => "abc"))
       File.write(File.join(docs, "b.json"), JSON.generate("plan_id" => "abc"))
       FileUtils.rm(File.join(run, "decisions.json"))
@@ -401,6 +412,19 @@ class MoneyWizImportTest < Minitest::Test
       assert File.exist?(File.join(docs, "moneywiz-decisions-abc123.json")), "asking does not move the export"
       auto.call("n\n")
       assert_nil @result
+
+      # Apply adopts the export beside the plan; that copy means "done", not "apply again".
+      FileUtils.mv(File.join(docs, "moneywiz-decisions-abc123.json"), File.join(run, "decisions.json"))
+      out = auto.call("y\n")
+      assert_equal ["import", [report]], @result
+      assert_includes out, "were applied on"
+      refute_includes out, "Reopen"
+      auto.call("n\n")
+      assert_nil @result
+      # A fresh export after that offers apply again.
+      File.write(File.join(docs, "moneywiz-decisions-abc123.json"), JSON.generate("type" => "moneywiz-decisions", "version" => 1, "plan_id" => "abc123", "source_hashes" => [sha], "decisions" => {}))
+      auto.call("y\n")
+      assert_equal ["apply", [File.join(run, "plan.json")]], @result
     ensure
       $stdin = STDIN
     end

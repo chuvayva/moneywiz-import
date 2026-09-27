@@ -839,29 +839,33 @@ module MoneyWizImport
     DOWNLOADS = File.join(Dir.home, "Downloads")
     REPORT_NAME = /\AReport-(\d{4}-\d{2}-\d{2})(?: \(\d+\))?\.xlsx\z/
 
-    # decisions.json beside the plan wins. Browsers open their save dialog in
-    # Documents or Downloads, so a UI export for this exact plan found there is
-    # reported as well. Anything ambiguous is left to --decisions.
-    def self.find_decisions(plan, run_dir, search: HOME_SEARCH)
-      beside = File.join(run_dir, "decisions.json")
-      return beside if File.exist?(beside)
-      return nil unless plan["id"]
-      strays = search.flat_map { |dir| Dir.glob(File.join(dir, "*.json")) }.select do |path|
-        File.size(path) < 5_000_000 && JSON.parse(File.read(path))["plan_id"] == plan["id"]
-      rescue JSON::ParserError, Errno::EACCES
-        false
+    # Browsers open their save dialog in Documents or Downloads, so a UI export for
+    # this exact plan found there counts as much as decisions.json beside the plan;
+    # the newest file wins, since a re-saved export is the reviewer's latest word.
+    # Anything ambiguous is left to --decisions.
+    def self.find_decisions(plan, run_dir, search: HOME_SEARCH, beside: true)
+      found = []
+      beside_path = File.join(run_dir, "decisions.json")
+      found << beside_path if beside && File.exist?(beside_path)
+      if plan["id"]
+        strays = search.flat_map { |dir| Dir.glob(File.join(dir, "*.json")) }.select do |path|
+          File.size(path) < 5_000_000 && JSON.parse(File.read(path))["plan_id"] == plan["id"]
+        rescue JSON::ParserError, Errno::EACCES
+          false
+        end
+        raise Error, "Several decisions files belong to this plan; pass one with --decisions:\n  #{strays.join("\n  ")}" if strays.size > 1
+        found.concat(strays)
       end
-      return nil if strays.empty?
-      raise Error, "Several decisions files belong to this plan; pass one with --decisions:\n  #{strays.join("\n  ")}" if strays.size > 1
-      strays.first
+      found.max_by { |path| [File.mtime(path), path == beside_path ? 0 : 1] }
     end
 
-    # Same lookup, but a stray export is adopted into the run folder first.
+    # Same lookup, but a stray export is adopted into the run folder first,
+    # replacing the copy an earlier apply left there.
     def self.locate_decisions(plan, run_dir, search: HOME_SEARCH)
       found = find_decisions(plan, run_dir, search: search)
       beside = File.join(run_dir, "decisions.json")
       return found if found.nil? || found == beside
-      warn "Adopting #{found} into #{run_dir}"
+      warn "Adopting #{found} into #{run_dir}#{File.exist?(beside) ? ' (replacing the decisions applied earlier)' : ''}"
       FileUtils.mv(found, beside)
       beside
     end
@@ -902,8 +906,10 @@ module MoneyWizImport
       raise Error, "No Report-YYYY-MM-DD.xlsx found in #{downloads}; pass a statement path to import" unless report
       puts "Statement: #{report} (modified #{File.mtime(report).strftime('%Y-%m-%d %H:%M')})"
       plans = plans_for(Digest::SHA256.file(report).hexdigest, imports: imports)
+      # Only a file saved from the review page counts here: apply moves that file
+      # beside the plan, so a copy already there means the plan was applied.
       reviewed = plans.filter_map do |path, plan|
-        decisions = find_decisions(plan, File.dirname(path), search: search)
+        decisions = find_decisions(plan, File.dirname(path), search: search, beside: false)
         [path, plan, decisions] if decisions
       end.first
       if reviewed
@@ -918,7 +924,14 @@ module MoneyWizImport
       if plans.any?
         path, plan = plans.first
         puts "Plan: #{path} (created #{plan['created_at']})"
-        puts "No decisions file for this plan beside it, in Documents, or in Downloads."
+        applied = File.join(File.dirname(path), "decisions.json")
+        if File.exist?(applied)
+          puts "Its decisions were applied on #{File.mtime(applied).strftime('%Y-%m-%d %H:%M')} (#{applied})."
+          puts "Save a new decisions file from the review page to apply again, or import afresh to see what remains."
+          return ["import", [report]] if confirm("Start a fresh import of the statement?")
+          return nil
+        end
+        puts "No decisions file for this plan in Documents or Downloads."
         return ["review", [path]] if confirm("Reopen its review page?")
         return ["import", [report]] if confirm("Start a fresh import of the statement instead?")
         return nil
